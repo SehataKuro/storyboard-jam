@@ -2,19 +2,19 @@
   "name": "storyboard-jam",
   "version": "0.1.0",
   "private": true,
-  "engines": { "node": ">=22.13.0" },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
     "deploy": "npm run build && wrangler deploy --config dist/server/wrangler.json",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate:remote": "wrangler d1 migrations apply storyboard-jam-db --remote"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
-    "drizzle-orm": "0.45.2",
+    "mp4-muxer": "^5.2.2",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
@@ -29,7 +29,6 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
-    "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react": "7.37.5",
