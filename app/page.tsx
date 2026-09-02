@@ -131,6 +131,8 @@ export default function Home() {
   const [helpOpen, setHelpOpen] = useState(false);
   /** Live preview while a boundary is being dragged; committed on release. */
   const [drag, setDrag] = useState<{ cutId: string; start: number } | null>(null);
+  /** True while the playhead is being dragged along the timeline. */
+  const [scrubbing, setScrubbing] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -510,6 +512,7 @@ export default function Home() {
   const onTimelinePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     seek(((event.clientX - rect.left) / rect.width) * totalDuration);
+    setScrubbing(true);
   };
 
   /** Where a boundary is allowed to land: never past its neighbours. */
@@ -526,10 +529,31 @@ export default function Home() {
     return ((clientX - rect.left) / rect.width) * totalDuration;
   };
 
+  // Dragging the timeline scrubs the playhead. Tracked on the window so the
+  // drag keeps working once the pointer leaves the timeline.
+  useEffect(() => {
+    if (!scrubbing) return;
+    const onMove = (event: PointerEvent) => {
+      event.preventDefault();
+      seek(timeAtClientX(event.clientX));
+    };
+    const onUp = () => setScrubbing(false);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrubbing, seek, totalDuration]);
+
   const beginBoundaryDrag = (event: ReactPointerEvent<HTMLButtonElement>, index: number) => {
     event.stopPropagation();
     event.preventDefault();
     dragIndexRef.current = index;
+    setScrubbing(false);
     setDrag({ cutId: cuts[index].id, start: cuts[index].start });
   };
 
@@ -685,7 +709,7 @@ export default function Home() {
         <div className="timeline-scroller">
           <div className="track-labels"><span>VIDEO</span><span>AUDIO</span></div>
           <div className="timeline-viewport" ref={viewportRef}>
-            <div className="timeline" ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
+            <div className={`timeline ${scrubbing ? "scrubbing" : ""}`} ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
               <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatTime(v * totalDuration).slice(0, 5)}</span>)}</div>
               <div className="video-track">
                 {cuts.map((cut, index) => (
