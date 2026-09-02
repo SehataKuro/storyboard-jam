@@ -22,7 +22,6 @@
     "@cloudflare/vite-plugin": "1.37.1",
     "@eslint/js": "9.39.4",
     "@next/eslint-plugin-next": "16.2.6",
-    "@rolldown/binding-win32-x64-msvc": "^1.0.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
@@ -40,5 +39,8 @@
     "vite": "8.0.13",
     "wrangler": "4.92.0"
   },
-  "type": "module"
+  "type": "module",
+  "optionalDependencies": {
+    "@rolldown/binding-win32-x64-msvc": "^1.0.1"
+  }
 }
