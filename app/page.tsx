@@ -59,6 +59,9 @@ function frameBox(width: number, height: number, withMargin: boolean) {
 }
 
 const MAX_STAGE_WIDTH = 1120;
+const MIN_TIMELINE_ZOOM = 1;
+const MAX_TIMELINE_ZOOM = 40;
+const clamp = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
 type CutContent = Pick<Cut, "strokes" | "backgroundImage">;
 
 const cutContent = (cut: Cut): CutContent => ({
@@ -283,6 +286,8 @@ export default function Home() {
   const [drag, setDrag] = useState<{ cutId: string; start: number } | null>(null);
   /** True while the playhead is being dragged along the timeline. */
   const [scrubbing, setScrubbing] = useState(false);
+  /** True while the timeline is being panned with the middle button. */
+  const [panning, setPanning] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -846,6 +851,7 @@ export default function Home() {
   }, [busy, currentTime, activeIndex, togglePlay, splitAtPlayhead, deleteCut, chooseCut, seek, undo, redo]);
 
   const onTimelinePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
     const rect = event.currentTarget.getBoundingClientRect();
     seek(((event.clientX - rect.left) / rect.width) * totalDuration);
     setScrubbing(true);
@@ -885,6 +891,7 @@ export default function Home() {
   }, [scrubbing, seek, timeAtClientX]);
 
   const beginBoundaryDrag = (event: ReactPointerEvent<HTMLButtonElement>, index: number) => {
+    if (event.button !== 0) return;
     event.stopPropagation();
     event.preventDefault();
     dragIndexRef.current = index;
@@ -929,6 +936,61 @@ export default function Home() {
     const cut = projectRef.current.cuts[index];
     mutate({ type: "move", cutId: cut.id, start: Math.min(Math.max(cut.start + step, lower), upper) });
   };
+
+  /** Set by a wheel zoom; consumed once the wider timeline has been laid out. */
+  const zoomAnchorRef = useRef<{ ratio: number; offset: number } | null>(null);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    const anchor = zoomAnchorRef.current;
+    if (!viewport || !anchor) return;
+    zoomAnchorRef.current = null;
+    viewport.scrollLeft = anchor.ratio * viewport.scrollWidth - anchor.offset;
+  }, [zoom]);
+
+  // Blender-style navigation: the wheel zooms, shift+wheel and the middle
+  // button pan. Registered by hand because the wheel must be cancellable.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      if (event.shiftKey) {
+        viewport.scrollLeft += event.deltaY + event.deltaX;
+        return;
+      }
+      const offset = event.clientX - viewport.getBoundingClientRect().left;
+      const ratio = (viewport.scrollLeft + offset) / Math.max(1, viewport.scrollWidth);
+      zoomAnchorRef.current = { ratio, offset };
+      setZoom((current) => clamp(current * Math.exp(-event.deltaY * 0.0015), MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM));
+    };
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, []);
+
+  const beginTimelinePan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 1) return;
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    event.preventDefault();
+    viewport.setPointerCapture(event.pointerId);
+    setPanning(true);
+  };
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!panning || !viewport) return;
+    const onMove = (event: PointerEvent) => { viewport.scrollLeft -= event.movementX; };
+    const onUp = () => setPanning(false);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [panning]);
 
   const rulerMarks = useMemo(() => {
     const count = Math.min(21, 5 * Math.round(zoom));
@@ -1054,16 +1116,18 @@ export default function Home() {
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             {audioUrl && <audio ref={audioRef} src={audioUrl} onEnded={() => setPlaying(false)} />}
           </div>
-          <div className="view-control" title="タイムラインの拡大縮小">
-            <button onClick={() => setZoom((z) => Math.max(1, z - 1))} aria-label="縮小">−</button>
-            <input type="range" min="1" max="8" step="1" value={zoom} aria-label="タイムラインの拡大率" onChange={(e) => setZoom(Number(e.target.value))} />
-            <button onClick={() => setZoom((z) => Math.min(8, z + 1))} aria-label="拡大">＋</button>
-            <b>{zoom}x</b>
+          <div className="view-control" title="タイムラインの拡大縮小（ホイールで拡大、中ボタンドラッグで移動）">
+            <button onClick={() => setZoom((z) => Math.max(MIN_TIMELINE_ZOOM, z / 1.5))} aria-label="縮小">−</button>
+            <input type="range" min={MIN_TIMELINE_ZOOM} max={MAX_TIMELINE_ZOOM} step="0.1" value={zoom}
+              aria-label="タイムラインの拡大率" onChange={(e) => setZoom(Number(e.target.value))} />
+            <button onClick={() => setZoom((z) => Math.min(MAX_TIMELINE_ZOOM, z * 1.5))} aria-label="拡大">＋</button>
+            <b>{zoom < 10 ? zoom.toFixed(1) : Math.round(zoom)}x</b>
           </div>
         </div>
         <div className="timeline-scroller">
           <div className="track-labels"><span>VIDEO</span><span>AUDIO</span></div>
-          <div className="timeline-viewport" ref={viewportRef}>
+          <div className={`timeline-viewport ${panning ? "panning" : ""}`} ref={viewportRef}
+            onPointerDown={beginTimelinePan} onAuxClick={(e) => e.preventDefault()}>
             <div className={`timeline ${scrubbing ? "scrubbing" : ""}`} ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
               <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatFramePosition(v * totalDuration)}</span>)}</div>
               <div className="video-track">

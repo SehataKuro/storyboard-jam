@@ -112,7 +112,8 @@ button { cursor:pointer; }
 @media (max-width:680px) { .export-actions { display:none; } }
 
 /* --- timeline zoom, volume, shortcuts --- */
-.timeline-viewport { min-width:0; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; }
+.timeline-viewport { min-width:0; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; overscroll-behavior-x:contain; }
+.timeline-viewport.panning { cursor:grabbing; }
 .timeline-viewport .timeline { min-width:100%; margin:0 0 10px; }
 .view-control { display:flex; align-items:center; gap:5px; color:#9a958d; font-size:11px; }
 .view-control button { border:1px solid #5c5851; background:transparent; color:#cfcac1; border-radius:4px; width:20px; height:20px; line-height:1; padding:0; }
