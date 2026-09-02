@@ -1,20 +1,38 @@
 "use client";
 
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Cut, DEFAULT_FPS, EXPORT_HEIGHT, EXPORT_WIDTH, Point, Stroke, cutStartOf, totalDurationOf } from "./lib/types";
+import {
+  DEFAULT_FPS,
+  EXPORT_HEIGHT,
+  EXPORT_WIDTH,
+  MIN_CUT_DURATION,
+  Point,
+  Project,
+  Stroke,
+  createEmptyProject,
+  cutDurationOf,
+  cutIndexAt,
+  newCutId,
+  normalizeProject,
+} from "./lib/types";
 import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
+import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
 import { paintStrokes } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
-const INITIAL_CUTS: Cut[] = [
-  { id: "c1", title: "朝の部屋", duration: 3.2, note: "窓から差し込む光。ゆっくり寄る。", strokes: [] },
-  { id: "c2", title: "目を開ける", duration: 2.3, note: "音の立ち上がりで目を開く。", strokes: [] },
-  { id: "c3", title: "走り出す", duration: 4.1, note: "ビートに合わせてカメラを振る。", strokes: [] },
-  { id: "c4", title: "街の俯瞰", duration: 3.4, note: "サビ前。空を広く見せる。", strokes: [] },
-  { id: "c5", title: "振り返る", duration: 2.7, note: "一瞬だけ静止。", strokes: [] },
-  { id: "c6", title: "タイトル", duration: 4.3, note: "余韻を残して暗転。", strokes: [] },
+
+const SHORTCUTS: [string, string][] = [
+  ["Space", "再生 / 停止"],
+  ["S", "再生位置でカットを分割"],
+  ["B / E", "ペン / 消しゴム"],
+  ["[ / ]", "ブラシを細く / 太く"],
+  ["← / →", "1秒移動（Shiftで1フレーム）"],
+  [", / .", "前 / 次のカットへ"],
+  ["Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直す"],
+  ["Delete", "選択中のカットを削除"],
+  ["?", "このヘルプ"],
 ];
 
 function formatTime(seconds: number) {
@@ -90,48 +108,52 @@ const ROLE_LABEL: Record<RoomRole, string> = {
 };
 
 export default function Home() {
-  const [cuts, setCuts] = useState<Cut[]>(INITIAL_CUTS);
-  const [activeId, setActiveId] = useState("c1");
+  const [project, setProject] = useState<Project>(() => createEmptyProject());
+  const [activeId, setActiveId] = useState("");
   const [selectedTool, setSelectedTool] = useState<"pen" | "eraser">("pen");
   const [color, setColor] = useState(COLORS[0]);
   const [brushSize, setBrushSize] = useState(3);
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [audioName, setAudioName] = useState("デモトラック");
+  const [audioName, setAudioName] = useState("");
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [volume, setVolume] = useState(0.8);
+  const [zoom, setZoom] = useState(1);
   const [panelOpen, setPanelOpen] = useState(true);
-  const [toast, setToast] = useState("ようこそ。ルームを開きました");
+  const [toast, setToast] = useState("ルームを開きました");
   const [draft, setDraft] = useState<Stroke | null>(null);
   const [collabPulse, setCollabPulse] = useState(false);
-  const [projectName, setProjectName] = useState("雨上がりのMV");
+  const [projectName, setProjectName] = useState("");
   const [role, setRole] = useState<RoomRole>("connecting");
   const [peers, setPeers] = useState(0);
   const [busy, setBusy] = useState<{ label: string; ratio: number } | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
-  const timelineRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
   const historyRef = useRef<Record<string, Stroke[][]>>({});
   const redoRef = useRef<Record<string, Stroke[][]>>({});
   const roomRef = useRef<Room | null>(null);
-  const cutsRef = useRef<Cut[]>(INITIAL_CUTS);
-  const isHostRef = useRef(false);
+  const projectRef = useRef<Project>(project);
 
-  const totalDuration = useMemo(() => totalDurationOf(cuts), [cuts]);
+  const cuts = project.cuts;
+  const totalDuration = project.duration;
   const activeIndex = Math.max(0, cuts.findIndex((cut) => cut.id === activeId));
   const activeCut = cuts[activeIndex] || cuts[0];
-  const cutStart = useCallback((index: number) => cutStartOf(cuts, index), [cuts]);
+  const activeDuration = cutDurationOf(project, activeIndex);
+  const isLastCut = activeIndex === cuts.length - 1;
+  const exportName = projectName.trim() || "storyboard";
 
-  useEffect(() => { cutsRef.current = cuts; }, [cuts]);
-  useEffect(() => { isHostRef.current = role === "host"; }, [role]);
+  useEffect(() => { projectRef.current = project; }, [project]);
 
   /** Local edits go through here: the host owns state, guests only propose. */
   const mutate = useCallback((op: RoomOp) => {
-    const next = applyOp(cutsRef.current, op);
-    cutsRef.current = next;
-    setCuts(next);
+    const next = applyOp(projectRef.current, op);
+    projectRef.current = next;
+    setProject(next);
     const room = roomRef.current;
     if (!room) return;
     if (room.isHost()) room.broadcastSnapshot(next);
@@ -140,24 +162,24 @@ export default function Home() {
 
   useEffect(() => {
     const stored = window.localStorage.getItem("conte-live-project");
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored) as { cuts: Cut[]; projectName?: string };
-        if (parsed.cuts?.length) {
-          cutsRef.current = parsed.cuts;
-          setCuts(parsed.cuts);
-          setActiveId(parsed.cuts[0].id);
-        }
-        if (parsed.projectName) setProjectName(parsed.projectName);
-      } catch { /* keep demo project */ }
-    }
+    if (!stored) return;
+    try {
+      const parsed = JSON.parse(stored) as { project?: Project; projectName?: string };
+      if (parsed.project?.cuts?.length) {
+        const restored = normalizeProject(parsed.project);
+        projectRef.current = restored;
+        setProject(restored);
+        setActiveId(restored.cuts[0].id);
+      }
+      if (parsed.projectName) setProjectName(parsed.projectName);
+    } catch { /* start from an empty board */ }
   }, []);
 
   // Only the host persists: it is the copy everyone else is mirroring.
   useEffect(() => {
     if (role !== "host") return;
-    window.localStorage.setItem("conte-live-project", JSON.stringify({ cuts, projectName }));
-  }, [cuts, projectName, role]);
+    window.localStorage.setItem("conte-live-project", JSON.stringify({ project, projectName }));
+  }, [project, projectName, role]);
 
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -179,19 +201,19 @@ export default function Home() {
       onStatus: setToast,
       onPeers: setPeers,
       onSnapshot: (incoming) => {
-        cutsRef.current = incoming;
-        setCuts(incoming);
-        setActiveId((current) => (incoming.some((cut) => cut.id === current) ? current : incoming[0]?.id || current));
+        projectRef.current = incoming;
+        setProject(incoming);
+        setActiveId((current) => (incoming.cuts.some((cut) => cut.id === current) ? current : incoming.cuts[0]?.id || current));
         pulse();
       },
       onOp: (op) => {
-        const next = applyOp(cutsRef.current, op);
-        cutsRef.current = next;
-        setCuts(next);
+        const next = applyOp(projectRef.current, op);
+        projectRef.current = next;
+        setProject(next);
         roomRef.current?.broadcastSnapshot(next);
         pulse();
       },
-      getSnapshot: () => cutsRef.current,
+      getSnapshot: () => projectRef.current,
     });
     roomRef.current = room;
     room.connect();
@@ -214,14 +236,13 @@ export default function Home() {
 
   // Playback position is intentionally local: every participant scrubs independently.
   useEffect(() => {
-    let elapsed = 0;
-    let found = cuts[0]?.id;
-    for (const cut of cuts) {
-      if (currentTime < elapsed + cut.duration) { found = cut.id; break; }
-      elapsed += cut.duration;
-    }
+    const found = cuts[cutIndexAt(project, currentTime)]?.id;
     if (found && found !== activeId) setActiveId(found);
-  }, [currentTime, cuts]);
+  }, [currentTime, project]);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.volume = volume;
+  }, [volume, audioUrl]);
 
   useEffect(() => {
     if (!playing) {
@@ -247,26 +268,37 @@ export default function Home() {
     return () => { if (animationRef.current) cancelAnimationFrame(animationRef.current); };
   }, [playing, audioUrl, totalDuration]);
 
-  const seek = (time: number) => {
+  // Follow the playhead when the timeline is zoomed past the viewport.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || zoom <= 1) return;
+    const x = (currentTime / totalDuration) * viewport.scrollWidth;
+    if (x < viewport.scrollLeft || x > viewport.scrollLeft + viewport.clientWidth - 40) {
+      viewport.scrollLeft = Math.max(0, x - viewport.clientWidth / 2);
+    }
+  }, [currentTime, zoom, totalDuration]);
+
+  const seek = useCallback((time: number) => {
     const next = Math.max(0, Math.min(totalDuration, time));
     setCurrentTime(next);
     if (audioRef.current) audioRef.current.currentTime = Math.min(next, audioRef.current.duration || next);
     playStartRef.current = { at: performance.now(), time: next };
-  };
+  }, [totalDuration]);
 
-  const togglePlay = async () => {
-    if (currentTime >= totalDuration) seek(0);
+  const togglePlay = useCallback(async () => {
     if (playing) {
       setPlaying(false);
       audioRef.current?.pause();
-    } else {
-      setPlaying(true);
-      if (audioUrl && audioRef.current) {
-        audioRef.current.currentTime = currentTime;
-        await audioRef.current.play().catch(() => setPlaying(false));
-      }
+      return;
     }
-  };
+    const from = currentTime >= totalDuration ? 0 : currentTime;
+    if (from !== currentTime) seek(0);
+    setPlaying(true);
+    if (audioUrl && audioRef.current) {
+      audioRef.current.currentTime = from;
+      await audioRef.current.play().catch(() => setPlaying(false));
+    }
+  }, [playing, currentTime, totalDuration, audioUrl, seek]);
 
   const pointerPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -292,65 +324,86 @@ export default function Home() {
     setDraft(null);
   };
 
-  const undo = () => {
+  const undo = useCallback(() => {
+    const cut = projectRef.current.cuts.find((c) => c.id === activeId);
     const history = historyRef.current[activeId] || [];
-    if (!history.length) return;
-    const previous = history[history.length - 1];
-    redoRef.current[activeId] = [...(redoRef.current[activeId] || []), activeCut.strokes];
+    if (!cut || !history.length) return;
+    redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cut.strokes];
     historyRef.current[activeId] = history.slice(0, -1);
-    mutate({ type: "strokes", cutId: activeId, strokes: previous });
-  };
+    mutate({ type: "strokes", cutId: activeId, strokes: history[history.length - 1] });
+  }, [activeId, mutate]);
 
-  const redo = () => {
+  const redo = useCallback(() => {
+    const cut = projectRef.current.cuts.find((c) => c.id === activeId);
     const redoStack = redoRef.current[activeId] || [];
-    if (!redoStack.length) return;
-    const next = redoStack[redoStack.length - 1];
-    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), activeCut.strokes];
+    if (!cut || !redoStack.length) return;
+    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cut.strokes];
     redoRef.current[activeId] = redoStack.slice(0, -1);
-    mutate({ type: "strokes", cutId: activeId, strokes: next });
-  };
+    mutate({ type: "strokes", cutId: activeId, strokes: redoStack[redoStack.length - 1] });
+  }, [activeId, mutate]);
 
-  const addCut = () => {
-    const id = `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
-    mutate({ type: "add", cut: { id, title: `新しいカット ${cuts.length + 1}`, duration: 3, note: "演出メモを入力…", strokes: [] }, afterId: null });
+  /** Cuts are created by splitting the song at the playhead, never by appending a length. */
+  const splitAtPlayhead = useCallback(() => {
+    const current = projectRef.current;
+    if (currentTime <= MIN_CUT_DURATION || currentTime >= current.duration - MIN_CUT_DURATION) {
+      setToast("この位置では分割できません");
+      return;
+    }
+    if (current.cuts.some((cut) => Math.abs(cut.start - currentTime) < MIN_CUT_DURATION)) {
+      setToast("すでにこの位置で分割されています");
+      return;
+    }
+    const id = newCutId();
+    mutate({ type: "split", at: currentTime, id });
     setActiveId(id);
-    setCurrentTime(totalDuration);
-    setToast("カットを追加しました");
-  };
+    setToast(`${formatTime(currentTime)} で分割しました`);
+  }, [currentTime, mutate]);
 
-  const duplicateCut = () => {
-    const id = `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
-    const clone = { ...activeCut, id, title: `${activeCut.title} コピー`, strokes: activeCut.strokes.map((s) => ({ ...s, points: [...s.points] })) };
-    mutate({ type: "add", cut: clone, afterId: activeCut.id });
-    setToast("カットを複製しました");
-  };
-
-  const deleteCut = () => {
-    if (cuts.length <= 1) return;
-    const next = cuts.filter((cut) => cut.id !== activeId);
+  const deleteCut = useCallback(() => {
+    if (projectRef.current.cuts.length <= 1) {
+      setToast("最後のカットは削除できません");
+      return;
+    }
+    const remaining = projectRef.current.cuts.filter((cut) => cut.id !== activeId);
     mutate({ type: "delete", cutId: activeId });
-    setActiveId(next[Math.min(activeIndex, next.length - 1)].id);
+    setActiveId(remaining[Math.max(0, Math.min(activeIndex, remaining.length - 1))].id);
     setToast("カットを削除しました");
-  };
+  }, [activeId, activeIndex, mutate]);
 
-  const updateActive = (patch: Partial<Pick<Cut, "title" | "duration" | "note">>) =>
+  const updateActive = (patch: { title?: string; note?: string }) =>
     mutate({ type: "patch", cutId: activeId, patch });
 
-  const chooseCut = (cut: Cut, index: number) => {
-    setActiveId(cut.id);
-    seek(cutStart(index));
+  /** Editing a cut's length moves the boundary that follows it; the song length never changes. */
+  const updateActiveDuration = (seconds: number) => {
+    const next = cuts[activeIndex + 1];
+    if (!next) return;
+    mutate({ type: "move", cutId: next.id, start: activeCut.start + Math.max(MIN_CUT_DURATION, seconds) });
   };
+
+  const chooseCut = useCallback((index: number) => {
+    const cut = projectRef.current.cuts[index];
+    if (!cut) return;
+    setActiveId(cut.id);
+    seek(cut.start);
+  }, [seek]);
 
   const onAudio = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
     if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioUrl(URL.createObjectURL(file));
+    const url = URL.createObjectURL(file);
+    setAudioUrl(url);
     setAudioFile(file);
     setAudioName(file.name.replace(/\.[^.]+$/, ""));
     setPlaying(false);
     seek(0);
-    setToast("楽曲を読み込みました");
+    // The song owns the total length, so adopt it as soon as the metadata arrives.
+    const probe = new Audio(url);
+    probe.onloadedmetadata = () => {
+      if (!Number.isFinite(probe.duration) || probe.duration <= 0) return;
+      mutate({ type: "duration", value: probe.duration });
+      setToast(`楽曲に合わせて全体を ${formatTime(probe.duration)} にしました`);
+    };
   };
 
   const exportFrame = () => {
@@ -361,7 +414,7 @@ export default function Home() {
     if (!ctx) return;
     paintStrokes(ctx, activeCut.strokes, EXPORT_WIDTH, EXPORT_HEIGHT);
     const link = document.createElement("a");
-    link.download = `${activeCut.title}.png`;
+    link.download = `${cutLabel(activeCut.title, activeIndex)}.png`;
     link.href = canvas.toDataURL("image/png");
     link.click();
     setToast("現在のカットを書き出しました");
@@ -380,26 +433,26 @@ export default function Home() {
   };
 
   const exportSequence = () => runExport("連番書き出し", async () => {
-    const blob = await exportSequenceZip(cuts, {
+    const blob = await exportSequenceZip(projectRef.current, {
       fps: DEFAULT_FPS,
       width: EXPORT_WIDTH,
       height: EXPORT_HEIGHT,
-      projectName,
+      projectName: exportName,
       onProgress: (ratio, label) => setBusy({ ratio, label }),
     });
-    downloadBlob(blob, `${projectName}_sequence.zip`);
+    downloadBlob(blob, `${exportName}_sequence.zip`);
     setToast("連番PNGとAEスクリプトを書き出しました");
   });
 
   const exportMp4 = () => runExport("ムービー書き出し", async () => {
-    const result = await exportMovie(cuts, audioFile, {
+    const result = await exportMovie(projectRef.current, audioFile, {
       fps: DEFAULT_FPS,
       width: EXPORT_WIDTH,
       height: EXPORT_HEIGHT,
-      projectName,
+      projectName: exportName,
       onProgress: (ratio, label) => setBusy({ ratio, label }),
     });
-    downloadBlob(result.blob, `${projectName}.mp4`);
+    downloadBlob(result.blob, `${exportName}.mp4`);
     if (result.hadAudio && !result.audioCodec) setToast("音声コーデック非対応のため映像のみ書き出しました");
     else if (!result.hadAudio) setToast("音源未読み込みのため映像のみ書き出しました");
     // Opus inside MP4 plays in browsers but After Effects will not read it.
@@ -407,10 +460,53 @@ export default function Home() {
     else setToast("音声付きMP4を書き出しました");
   });
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      // Never steal keys from the cut name, note or any slider.
+      if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+      if (busy) return;
+
+      const step = event.shiftKey ? 1 / DEFAULT_FPS : 1;
+      const key = event.key;
+
+      if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redo(); else undo();
+        return;
+      }
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+      switch (key) {
+        case " ": event.preventDefault(); void togglePlay(); break;
+        case "s": case "S": event.preventDefault(); splitAtPlayhead(); break;
+        case "b": case "B": setSelectedTool("pen"); break;
+        case "e": case "E": setSelectedTool("eraser"); break;
+        case "[": setBrushSize((size) => Math.max(1, size - 1)); break;
+        case "]": setBrushSize((size) => Math.min(14, size + 1)); break;
+        case "ArrowLeft": event.preventDefault(); seek(currentTime - step); break;
+        case "ArrowRight": event.preventDefault(); seek(currentTime + step); break;
+        case ",": chooseCut(activeIndex - 1); break;
+        case ".": chooseCut(activeIndex + 1); break;
+        case "Delete": deleteCut(); break;
+        case "?": setHelpOpen((open) => !open); break;
+        case "Escape": setHelpOpen(false); break;
+        default: break;
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [busy, currentTime, activeIndex, togglePlay, splitAtPlayhead, deleteCut, chooseCut, seek, undo, redo]);
+
   const onTimelinePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     seek(((event.clientX - rect.left) / rect.width) * totalDuration);
   };
+
+  const rulerMarks = useMemo(() => {
+    const count = Math.min(21, 5 * Math.round(zoom));
+    return Array.from({ length: count }, (_, index) => index / (count - 1));
+  }, [zoom]);
 
   return (
     <main className="app-shell">
@@ -418,10 +514,11 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">C</span><span>CONTE</span><b>LIVE</b></div>
         <div className="project-title">
           <button className="crumb">Projects</button><span>/</span>
-          <input aria-label="プロジェクト名" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
+          <input aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
           <span className="saved"><i />{role === "host" ? "この端末に保存" : "ホストが保存中"}</span>
         </div>
         <div className="export-actions">
+          <button onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
           <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
           <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
         </div>
@@ -434,31 +531,34 @@ export default function Home() {
 
       <section className="workspace">
         <aside className="cuts-panel">
-          <div className="section-heading"><span>カット</span><button onClick={addCut} aria-label="カットを追加">＋</button></div>
+          <div className="section-heading"><span>カット</span><button onClick={splitAtPlayhead} title="再生位置で分割 (S)" aria-label="再生位置で分割">✂</button></div>
           <div className="cut-list">
             {cuts.map((cut, index) => (
-              <button key={cut.id} className={`cut-card ${cut.id === activeId ? "active" : ""}`} onClick={() => chooseCut(cut, index)}>
+              <button key={cut.id} className={`cut-card ${cut.id === activeId ? "active" : ""}`} onClick={() => chooseCut(index)}>
                 <span className="cut-no">{String(index + 1).padStart(2, "0")}</span>
                 <span className="thumb"><MiniCanvas strokes={cut.strokes} />{cut.strokes.length === 0 && <span className={`placeholder p${index % 4}`} />}</span>
-                <span className="cut-copy"><strong>{cut.title}</strong><small>{cut.duration.toFixed(1)}秒 · {formatTime(cutStart(index))}</small></span>
+                <span className="cut-copy">
+                  <strong className={cut.title.trim() ? "" : "untitled"}>{cutLabel(cut.title, index)}</strong>
+                  <small>{cutDurationOf(project, index).toFixed(1)}秒 · {formatTime(cut.start)}</small>
+                </span>
               </button>
             ))}
           </div>
-          <button className="add-cut" onClick={addCut}>＋ カットを追加</button>
+          <button className="add-cut" onClick={splitAtPlayhead}>✂ 再生位置で分割 <kbd>S</kbd></button>
         </aside>
 
         <section className="stage-area">
           <div className="tool-row">
             <div className="tools">
-              <button className={selectedTool === "pen" ? "selected" : ""} onClick={() => setSelectedTool("pen")} title="ペン"><span className="pen-icon" /></button>
-              <button className={selectedTool === "eraser" ? "selected" : ""} onClick={() => setSelectedTool("eraser")} title="消しゴム"><span className="eraser-icon" /></button>
+              <button className={selectedTool === "pen" ? "selected" : ""} onClick={() => setSelectedTool("pen")} title="ペン (B)"><span className="pen-icon" /></button>
+              <button className={selectedTool === "eraser" ? "selected" : ""} onClick={() => setSelectedTool("eraser")} title="消しゴム (E)"><span className="eraser-icon" /></button>
               <span className="divider" />
               {COLORS.map((swatch) => <button key={swatch} className={`swatch ${color === swatch ? "selected" : ""}`} style={{ "--swatch": swatch } as React.CSSProperties} onClick={() => { setColor(swatch); setSelectedTool("pen"); }} aria-label={`色 ${swatch}`} />)}
               <span className="divider" />
               <label className="size-control"><span>線</span><input type="range" min="1" max="14" value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} /><b>{brushSize}</b></label>
             </div>
             <div className="history-tools">
-              <button onClick={undo} title="元に戻す">↶</button><button onClick={redo} title="やり直す">↷</button>
+              <button onClick={undo} title="元に戻す (Ctrl+Z)">↶</button><button onClick={redo} title="やり直す (Ctrl+Shift+Z)">↷</button>
               <button className="panel-toggle" onClick={() => setPanelOpen((v) => !v)}>{panelOpen ? "メモを閉じる" : "メモを開く"}</button>
             </div>
           </div>
@@ -470,11 +570,18 @@ export default function Home() {
             </div>
             {panelOpen && <aside className="note-panel">
               <div className="note-head"><span>カット情報</span><button onClick={() => setPanelOpen(false)}>×</button></div>
-              <label>カット名<input value={activeCut.title} onChange={(e) => updateActive({ title: e.target.value })} /></label>
-              <label>尺<div className="duration-field"><input type="number" min="0.3" step="0.1" value={activeCut.duration} onChange={(e) => updateActive({ duration: Math.max(.3, Number(e.target.value)) })} /><span>秒</span></div></label>
+              <label>カット名<input placeholder={cutLabel("", activeIndex)} value={activeCut.title} onChange={(e) => updateActive({ title: e.target.value })} /></label>
+              <label>尺
+                <div className="duration-field">
+                  <input type="number" min={MIN_CUT_DURATION} step="0.1" value={activeDuration.toFixed(2)} disabled={isLastCut}
+                    onChange={(e) => updateActiveDuration(Number(e.target.value))} />
+                  <span>秒</span>
+                </div>
+              </label>
+              {isLastCut && <p className="field-hint">最後のカットは楽曲の終わりまでです</p>}
               <label>演出メモ<textarea value={activeCut.note} onChange={(e) => updateActive({ note: e.target.value })} /></label>
               <div className="tag-row"><span>CAM</span><button>FIX</button><button>PAN →</button><button>＋</button></div>
-              <div className="note-actions"><button onClick={duplicateCut}>複製</button><button onClick={exportFrame}>PNG</button><button className="danger" onClick={deleteCut}>削除</button></div>
+              <div className="note-actions"><button onClick={splitAtPlayhead}>分割</button><button onClick={exportFrame}>PNG</button><button className="danger" onClick={deleteCut}>削除</button></div>
             </aside>}
           </div>
         </section>
@@ -483,32 +590,61 @@ export default function Home() {
       <section className="transport">
         <div className="transport-main">
           <div className="playback">
-            <button onClick={() => seek(Math.max(0, currentTime - 1))}>−1s</button>
-            <button className="play" onClick={togglePlay} aria-label={playing ? "停止" : "再生"}>{playing ? "Ⅱ" : "▶"}</button>
-            <button onClick={() => seek(Math.min(totalDuration, currentTime + 1))}>+1s</button>
+            <button onClick={() => seek(currentTime - 1)} title="1秒戻す (←)">−1s</button>
+            <button className="play" onClick={togglePlay} aria-label={playing ? "停止" : "再生"} title="再生 / 停止 (Space)">{playing ? "Ⅱ" : "▶"}</button>
+            <button onClick={() => seek(currentTime + 1)} title="1秒進める (→)">+1s</button>
             <span className="timecode">{formatTime(currentTime)} <small>/ {formatTime(totalDuration)}</small></span>
           </div>
           <div className="audio-info">
-            <span className="wave-icon">≋</span><div><strong>{audioName}</strong><small>{audioUrl ? "読み込み済み · この端末だけで再生" : "デモ再生 · 音源を追加できます"}</small></div>
+            <span className="wave-icon">≋</span>
+            <div><strong>{audioName || "音源なし"}</strong><small>{audioUrl ? "この端末だけで再生" : "楽曲を読み込むと全体の尺が決まります"}</small></div>
+            <label className="volume-control" title="音量">
+              <span aria-hidden="true">🔈</span>
+              <input type="range" min="0" max="100" value={Math.round(volume * 100)} aria-label="音量"
+                onChange={(e) => setVolume(Number(e.target.value) / 100)} />
+            </label>
             <label className="audio-upload">音源を変更<input type="file" accept="audio/*" onChange={onAudio} /></label>
             {/* Playback engine for the timeline, not user-facing media, so there is nothing to caption. */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             {audioUrl && <audio ref={audioRef} src={audioUrl} onEnded={() => setPlaying(false)} />}
           </div>
-          <div className="view-control"><span>−</span><input type="range" min="70" max="130" defaultValue="100" /><span>＋</span></div>
+          <div className="view-control" title="タイムラインの拡大縮小">
+            <button onClick={() => setZoom((z) => Math.max(1, z - 1))} aria-label="縮小">−</button>
+            <input type="range" min="1" max="8" step="1" value={zoom} aria-label="タイムラインの拡大率" onChange={(e) => setZoom(Number(e.target.value))} />
+            <button onClick={() => setZoom((z) => Math.min(8, z + 1))} aria-label="拡大">＋</button>
+            <b>{zoom}x</b>
+          </div>
         </div>
         <div className="timeline-scroller">
           <div className="track-labels"><span>VIDEO</span><span>AUDIO</span></div>
-          <div className="timeline" ref={timelineRef} onPointerDown={onTimelinePointer}>
-            <div className="ruler">{[0, .25, .5, .75, 1].map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatTime(v * totalDuration).slice(0, 5)}</span>)}</div>
-            <div className="video-track">
-              {cuts.map((cut, index) => <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""}`} style={{ width: `${(cut.duration / totalDuration) * 100}%` }} onClick={(e) => { e.stopPropagation(); chooseCut(cut, index); }}><span>{index + 1}</span><b>{cut.title}</b></button>)}
+          <div className="timeline-viewport" ref={viewportRef}>
+            <div className="timeline" style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
+              <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatTime(v * totalDuration).slice(0, 5)}</span>)}</div>
+              <div className="video-track">
+                {cuts.map((cut, index) => (
+                  <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""}`}
+                    style={{ width: `${(cutDurationOf(project, index) / totalDuration) * 100}%` }}
+                    onClick={(e) => { e.stopPropagation(); chooseCut(index); }}>
+                    <span>{index + 1}</span><b>{cut.title}</b>
+                  </button>
+                ))}
+              </div>
+              <div className="audio-track"><div className="waveform">{Array.from({ length: 90 }, (_, i) => <i key={i} style={{ height: `${20 + ((i * 37) % 65)}%` }} />)}</div></div>
+              <div className="playhead" style={{ left: `${(currentTime / totalDuration) * 100}%` }}><i /></div>
             </div>
-            <div className="audio-track"><div className="waveform">{Array.from({ length: 90 }, (_, i) => <i key={i} style={{ height: `${20 + ((i * 37) % 65)}%` }} />)}</div></div>
-            <div className="playhead" style={{ left: `${(currentTime / totalDuration) * 100}%` }}><i /></div>
           </div>
         </div>
       </section>
+
+      {helpOpen && (
+        <div className="export-overlay">
+          <div className="help-card" role="dialog" aria-label="ショートカット一覧">
+            <strong>ショートカット</strong>
+            <dl>{SHORTCUTS.map(([keys, label]) => <div key={keys}><dt><kbd>{keys}</kbd></dt><dd>{label}</dd></div>)}</dl>
+            <button onClick={() => setHelpOpen(false)}>閉じる</button>
+          </div>
+        </div>
+      )}
 
       {busy && (
         <div className="export-overlay" role="status">

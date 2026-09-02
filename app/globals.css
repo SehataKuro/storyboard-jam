@@ -109,3 +109,26 @@ button { cursor:pointer; }
 .export-card small { font-size:10px; color:var(--muted); }
 @media (max-width:900px) { .export-actions button { padding:7px 8px; font-size:10px; } }
 @media (max-width:680px) { .export-actions { display:none; } }
+
+/* --- timeline zoom, volume, shortcuts --- */
+.timeline-viewport { min-width:0; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; }
+.timeline-viewport .timeline { min-width:100%; margin:0 0 10px; }
+.view-control { display:flex; align-items:center; gap:5px; color:#9a958d; font-size:11px; }
+.view-control button { border:1px solid #5c5851; background:transparent; color:#cfcac1; border-radius:4px; width:20px; height:20px; line-height:1; padding:0; }
+.view-control input { width:66px; accent-color:#c7c1b7; }
+.view-control b { font:9px var(--font-geist-mono),monospace; color:#cfcac1; width:18px; }
+.volume-control { display:flex; align-items:center; gap:5px; margin-left:auto; color:#9a958d; }
+.volume-control input { width:64px; accent-color:#65a27d; }
+.audio-info .audio-upload { margin-left:8px; }
+.cut-copy strong.untitled { color:#9d968b; font-weight:600; }
+.field-hint { margin:-6px 0 13px; font-size:9px; color:#8d877d; }
+.note-panel input:disabled { background:#f1ece2; color:#9a948a; }
+.add-cut kbd, .help-card kbd { font:9px var(--font-geist-mono),monospace; background:#ebe5da; border:1px solid #cec7ba; border-radius:3px; padding:1px 4px; color:#5b554c; }
+.help-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px 24px; min-width:320px; max-width:min(440px,90vw); box-shadow:0 12px 32px rgba(0,0,0,.24); }
+.help-card strong { font-size:12px; letter-spacing:.08em; display:block; margin-bottom:14px; }
+.help-card dl { margin:0; display:flex; flex-direction:column; gap:8px; }
+.help-card dl div { display:grid; grid-template-columns:150px 1fr; align-items:center; gap:10px; }
+.help-card dt { margin:0; }
+.help-card dd { margin:0; font-size:11px; color:#5b554c; }
+.help-card > button { margin-top:18px; width:100%; border:1px solid var(--line); background:#fffefa; border-radius:7px; padding:8px; font-size:11px; font-weight:700; }
+@media (max-width:680px) { .volume-control { display:none; } .help-card dl div { grid-template-columns:110px 1fr; } }

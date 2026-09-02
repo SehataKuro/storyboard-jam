@@ -1,10 +1,15 @@
-import { Cut, Stroke } from "./types";
+import { MIN_CUT_DURATION, Project, Stroke, newCutId, normalizeProject } from "./types";
 
 export type RoomOp =
   | { type: "strokes"; cutId: string; strokes: Stroke[] }
-  | { type: "patch"; cutId: string; patch: Partial<Pick<Cut, "title" | "duration" | "note">> }
-  | { type: "add"; cut: Cut; afterId: string | null }
-  | { type: "delete"; cutId: string };
+  | { type: "patch"; cutId: string; patch: { title?: string; note?: string } }
+  /** Insert a cut boundary at a point on the song timeline. */
+  | { type: "split"; at: number; id: string }
+  /** Move an existing boundary, which resizes the cut before it. */
+  | { type: "move"; cutId: string; start: number }
+  | { type: "delete"; cutId: string }
+  /** Host loaded a song, so the whole board adopts its length. */
+  | { type: "duration"; value: number };
 
 export type RoomRole = "connecting" | "host" | "guest" | "closed";
 
@@ -13,10 +18,10 @@ export type RoomHandlers = {
   onStatus: (text: string) => void;
   onPeers: (count: number) => void;
   /** Guest side: authoritative project pushed by the host. */
-  onSnapshot: (cuts: Cut[]) => void;
+  onSnapshot: (project: Project) => void;
   /** Host side: an edit proposed by a guest. */
   onOp: (op: RoomOp) => void;
-  getSnapshot: () => Cut[];
+  getSnapshot: () => Project;
 };
 
 const ICE_SERVERS: RTCIceServer[] = [
@@ -68,9 +73,9 @@ export class Room {
   }
 
   /** Host: push the authoritative project to every guest. */
-  broadcastSnapshot(cuts: Cut[]) {
+  broadcastSnapshot(project: Project) {
     if (this.role !== "host") return;
-    const payload = JSON.stringify({ type: "snapshot", cuts });
+    const payload = JSON.stringify({ type: "snapshot", project });
     this.links.forEach((link) => {
       if (link.channel?.readyState === "open") link.channel.send(payload);
     });
@@ -152,15 +157,15 @@ export class Room {
     channel.onopen = () => {
       this.handlers.onPeers(this.links.size);
       if (this.role === "host") {
-        channel.send(JSON.stringify({ type: "snapshot", cuts: this.handlers.getSnapshot() }));
+        channel.send(JSON.stringify({ type: "snapshot", project: this.handlers.getSnapshot() }));
         this.handlers.onStatus("参加者が入室しました");
       } else {
         this.handlers.onStatus("ホストに接続しました");
       }
     };
     channel.onmessage = (event) => {
-      const data = JSON.parse(event.data as string) as { type: string; cuts?: Cut[]; op?: RoomOp };
-      if (data.type === "snapshot" && data.cuts && this.role === "guest") this.handlers.onSnapshot(data.cuts);
+      const data = JSON.parse(event.data as string) as { type: string; project?: Project; op?: RoomOp };
+      if (data.type === "snapshot" && data.project && this.role === "guest") this.handlers.onSnapshot(data.project);
       if (data.type === "op" && data.op && this.role === "host") this.handlers.onOp(data.op);
     };
     channel.onclose = () => this.handlers.onPeers(this.links.size);
@@ -212,15 +217,47 @@ export class Room {
 }
 
 /** Host-side reducer: the single place where a proposed op becomes project state. */
-export function applyOp(cuts: Cut[], op: RoomOp): Cut[] {
-  if (op.type === "strokes") return cuts.map((cut) => (cut.id === op.cutId ? { ...cut, strokes: op.strokes } : cut));
-  if (op.type === "patch") return cuts.map((cut) => (cut.id === op.cutId ? { ...cut, ...op.patch } : cut));
-  if (op.type === "delete") return cuts.length <= 1 ? cuts : cuts.filter((cut) => cut.id !== op.cutId);
-  if (op.type === "add") {
-    if (cuts.some((cut) => cut.id === op.cut.id)) return cuts;
-    const at = op.afterId ? cuts.findIndex((cut) => cut.id === op.afterId) : -1;
-    if (at < 0) return [...cuts, op.cut];
-    return [...cuts.slice(0, at + 1), op.cut, ...cuts.slice(at + 1)];
+export function applyOp(project: Project, op: RoomOp): Project {
+  if (op.type === "strokes") {
+    return { ...project, cuts: project.cuts.map((cut) => (cut.id === op.cutId ? { ...cut, strokes: op.strokes } : cut)) };
   }
-  return cuts;
+
+  if (op.type === "patch") {
+    return { ...project, cuts: project.cuts.map((cut) => (cut.id === op.cutId ? { ...cut, ...op.patch } : cut)) };
+  }
+
+  if (op.type === "delete") {
+    // The first cut owns time zero, so removing it would leave a gap.
+    if (project.cuts.length <= 1) return project;
+    const index = project.cuts.findIndex((cut) => cut.id === op.cutId);
+    if (index < 0) return project;
+    const cuts = project.cuts.filter((cut) => cut.id !== op.cutId);
+    if (index === 0) cuts[0] = { ...cuts[0], start: 0 };
+    return { ...project, cuts };
+  }
+
+  if (op.type === "split") {
+    const at = op.at;
+    if (at <= MIN_CUT_DURATION || at >= project.duration - MIN_CUT_DURATION) return project;
+    if (project.cuts.some((cut) => Math.abs(cut.start - at) < MIN_CUT_DURATION)) return project;
+    // The new cut is a fresh blank frame starting at the split point.
+    const cut = { id: op.id || newCutId(), title: "", note: "", start: at, strokes: [] };
+    return normalizeProject({ ...project, cuts: [...project.cuts, cut] });
+  }
+
+  if (op.type === "move") {
+    const index = project.cuts.findIndex((cut) => cut.id === op.cutId);
+    if (index <= 0) return project;
+    const lower = project.cuts[index - 1].start + MIN_CUT_DURATION;
+    const upper = (index + 1 < project.cuts.length ? project.cuts[index + 1].start : project.duration) - MIN_CUT_DURATION;
+    if (upper < lower) return project;
+    const start = Math.min(Math.max(op.start, lower), upper);
+    return { ...project, cuts: project.cuts.map((cut, i) => (i === index ? { ...cut, start } : cut)) };
+  }
+
+  if (op.type === "duration") {
+    return normalizeProject({ ...project, duration: op.value });
+  }
+
+  return project;
 }

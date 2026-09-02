@@ -1,18 +1,20 @@
-import { Cut, cutStartOf } from "./types";
+import { Project, cutDurationOf } from "./types";
 
 const escapeJs = (value: string) =>
   value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]+/g, " ");
+
+/** Cut names are optional in the editor, so exports fall back to a numbered label. */
+export const cutLabel = (title: string, index: number) => title.trim() || `CUT ${String(index + 1).padStart(2, "0")}`;
 
 /**
  * Builds an ExtendScript that imports the exported PNG sequence, creates a comp and
  * writes the cut switching timing as HOLD keyframes on Time Remap.
  * One exported image is exactly one source frame, so cut N maps to source time N/fps.
  */
-export function buildAeScript(cuts: Cut[], options: { fps: number; width: number; height: number; projectName: string }) {
+export function buildAeScript(project: Project, options: { fps: number; width: number; height: number; projectName: string }) {
   const { fps, width, height, projectName } = options;
-  const total = cuts.reduce((sum, cut) => sum + cut.duration, 0);
-  const rows = cuts.map((cut, index) =>
-    `  { name: "${escapeJs(cut.title)}", start: ${cutStartOf(cuts, index).toFixed(6)}, duration: ${cut.duration.toFixed(6)}, note: "${escapeJs(cut.note)}" }`,
+  const rows = project.cuts.map((cut, index) =>
+    `  { name: "${escapeJs(cutLabel(cut.title, index))}", start: ${cut.start.toFixed(6)}, duration: ${cutDurationOf(project, index).toFixed(6)}, note: "${escapeJs(cut.note)}" }`,
   ).join(",\n");
 
   return `// CONTE LIVE -> After Effects
@@ -22,7 +24,7 @@ export function buildAeScript(cuts: Cut[], options: { fps: number; width: number
   var FPS = ${fps};
   var WIDTH = ${width};
   var HEIGHT = ${height};
-  var TOTAL = ${total.toFixed(6)};
+  var TOTAL = ${project.duration.toFixed(6)};
   var COMP_NAME = "${escapeJs(projectName)}";
   var CUTS = [
 ${rows}
@@ -81,18 +83,15 @@ ${rows}
 }
 
 /** Human readable cut sheet shipped alongside the images. */
-export function buildCutSheet(cuts: Cut[], fps: number) {
-  const lines = cuts.map((cut, index) => {
-    const start = cutStartOf(cuts, index);
-    return [
-      String(index + 1).padStart(4, "0"),
-      `cut_${String(index + 1).padStart(4, "0")}.png`,
-      cut.title,
-      `${start.toFixed(3)}s`,
-      `${cut.duration.toFixed(3)}s`,
-      `frame ${Math.round(start * fps)}`,
-      cut.note.replace(/[\r\n]+/g, " "),
-    ].join("\t");
-  });
+export function buildCutSheet(project: Project, fps: number) {
+  const lines = project.cuts.map((cut, index) => [
+    String(index + 1).padStart(4, "0"),
+    `cut_${String(index + 1).padStart(4, "0")}.png`,
+    cutLabel(cut.title, index),
+    `${cut.start.toFixed(3)}s`,
+    `${cutDurationOf(project, index).toFixed(3)}s`,
+    `frame ${Math.round(cut.start * fps)}`,
+    cut.note.replace(/[\r\n]+/g, " "),
+  ].join("\t"));
   return ["No\tFile\tTitle\tStart\tDuration\tStartFrame\tNote", ...lines].join("\r\n");
 }

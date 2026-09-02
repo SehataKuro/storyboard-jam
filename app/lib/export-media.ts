@@ -1,8 +1,8 @@
 import { ArrayBufferTarget, Muxer } from "mp4-muxer";
 import { canvasToPngBlob, renderCutToCanvas } from "./render";
-import { buildAeScript, buildCutSheet } from "./ae";
+import { buildAeScript, buildCutSheet, cutLabel } from "./ae";
 import { createZip, ZipEntry } from "./zip";
-import { Cut, cutStartOf, totalDurationOf } from "./types";
+import { Project, cutDurationOf, cutEndOf } from "./types";
 
 export type ExportOptions = {
   fps: number;
@@ -18,8 +18,9 @@ const paddedName = (index: number) => `cut_${String(index + 1).padStart(4, "0")}
 const frameAt = (seconds: number, fps: number) => Math.round(seconds * fps);
 
 /** PNG sequence + AE script + cut sheet, bundled as a single ZIP. */
-export async function exportSequenceZip(cuts: Cut[], options: ExportOptions) {
+export async function exportSequenceZip(project: Project, options: ExportOptions) {
   const { fps, width, height, projectName, onProgress } = options;
+  const cuts = project.cuts;
   const entries: ZipEntry[] = [];
 
   for (let index = 0; index < cuts.length; index += 1) {
@@ -30,8 +31,8 @@ export async function exportSequenceZip(cuts: Cut[], options: ExportOptions) {
   }
 
   const encoder = new TextEncoder();
-  entries.push({ name: `${projectName}.jsx`, data: encoder.encode(buildAeScript(cuts, { fps, width, height, projectName })) });
-  entries.push({ name: "cut_sheet.txt", data: encoder.encode(buildCutSheet(cuts, fps)) });
+  entries.push({ name: `${projectName}.jsx`, data: encoder.encode(buildAeScript(project, { fps, width, height, projectName })) });
+  entries.push({ name: "cut_sheet.txt", data: encoder.encode(buildCutSheet(project, fps)) });
   entries.push({
     name: "timing.json",
     data: encoder.encode(JSON.stringify({
@@ -39,15 +40,15 @@ export async function exportSequenceZip(cuts: Cut[], options: ExportOptions) {
       fps,
       width,
       height,
-      totalDuration: totalDurationOf(cuts),
+      totalDuration: project.duration,
       cuts: cuts.map((cut, index) => ({
         index: index + 1,
         file: paddedName(index),
-        title: cut.title,
+        title: cutLabel(cut.title, index),
         note: cut.note,
-        start: cutStartOf(cuts, index),
-        duration: cut.duration,
-        startFrame: frameAt(cutStartOf(cuts, index), fps),
+        start: cut.start,
+        duration: cutDurationOf(project, index),
+        startFrame: frameAt(cut.start, fps),
         sourceTime: index / fps,
       })),
     }, null, 2)),
@@ -80,12 +81,13 @@ async function decodeAudio(file: File, maxDuration: number) {
 }
 
 /** Renders the whole storyboard to MP4 (H.264 + AAC) with the loaded track mixed in. */
-export async function exportMovie(cuts: Cut[], audioFile: File | null, options: ExportOptions) {
+export async function exportMovie(project: Project, audioFile: File | null, options: ExportOptions) {
   if (typeof window === "undefined" || typeof VideoEncoder === "undefined") {
     throw new Error("この環境はWebCodecsに未対応のため、ムービー書き出しを利用できません。");
   }
   const { fps, width, height, onProgress } = options;
-  const total = totalDurationOf(cuts);
+  const cuts = project.cuts;
+  const total = project.duration;
   const totalFrames = Math.max(1, frameAt(total, fps));
   const codec = await pickVideoCodec(width, height, fps);
 
@@ -125,9 +127,8 @@ export async function exportMovie(cuts: Cut[], audioFile: File | null, options: 
 
   let emitted = 0;
   for (let index = 0; index < cuts.length; index += 1) {
-    const start = cutStartOf(cuts, index);
-    const startFrame = frameAt(start, fps);
-    const endFrame = index === cuts.length - 1 ? totalFrames : frameAt(start + cuts[index].duration, fps);
+    const startFrame = frameAt(cuts[index].start, fps);
+    const endFrame = index === cuts.length - 1 ? totalFrames : frameAt(cutEndOf(project, index), fps);
     const canvas = renderCutToCanvas(cuts[index].strokes, width, height);
 
     for (let frame = startFrame; frame < endFrame; frame += 1) {
