@@ -77,7 +77,7 @@ button { cursor:pointer; }
 .note-panel input, .note-panel textarea { width:100%; display:block; margin-top:6px; background:#fffefa; border:1px solid #d7d0c4; border-radius:5px; padding:9px; font-size:11px; outline:none; }
 .note-panel input:focus, .note-panel textarea:focus { border-color:#ef8b73; box-shadow:0 0 0 2px rgba(239,139,115,.12); }
 .note-panel textarea { height:82px; resize:vertical; line-height:1.6; }
-.duration-field { position:relative; }.duration-field span { position:absolute; right:9px; top:15px; font-size:10px; }.duration-field input { padding-right:30px; }
+.duration-field { position:relative; }.duration-field span { position:absolute; right:9px; top:15px; font-size:9px; }.duration-field input { padding-right:48px; font-family:var(--font-geist-mono),monospace; }
 .tag-row { display:flex; align-items:center; gap:5px; margin:16px 0; }.tag-row span { font-size:8px; color:#898277; margin-right:4px; }.tag-row button { border:1px solid #d7d0c4; background:#fffefa; border-radius:4px; padding:5px 7px; font-size:8px; }
 .note-actions { display:flex; gap:5px; padding-top:12px; border-top:1px solid var(--line); }.note-actions button { flex:1; padding:7px 2px; border:1px solid #d7d0c4; background:#fffefa; border-radius:5px; font-size:9px; }.note-actions .danger { color:#bd4f3c; }
 

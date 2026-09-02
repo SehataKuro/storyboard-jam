@@ -17,8 +17,11 @@ import {
   createEmptyProject,
   cutDurationOf,
   cutIndexAt,
+  formatFrameDuration,
+  formatFramePosition,
   newCutId,
   normalizeProject,
+  parseFrameDuration,
 } from "./lib/types";
 import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
@@ -28,6 +31,8 @@ import { readBundleFromFiles, readBundleFromZip } from "./lib/project-io";
 import { STROKE_REFERENCE_WIDTH, canvasToPngBlob, drawContainedImage, renderCutToCanvas } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
+const LEGACY_STORAGE_KEY = "conte-live-project";
+const roomStorageKey = (roomId: string) => `${LEGACY_STORAGE_KEY}:${roomId}`;
 
 const SHORTCUTS: [string, string][] = [
   ["Space", "再生 / 停止"],
@@ -41,14 +46,6 @@ const SHORTCUTS: [string, string][] = [
   ["Delete", "選択中のカットを削除"],
   ["?", "このヘルプ"],
 ];
-
-function formatTime(seconds: number) {
-  const safe = Math.max(0, seconds || 0);
-  const min = Math.floor(safe / 60);
-  const sec = Math.floor(safe % 60).toString().padStart(2, "0");
-  const frame = Math.floor((safe % 1) * DEFAULT_FPS).toString().padStart(2, "0");
-  return `${min}:${sec}:${frame}`;
-}
 
 /**
  * Stage geometry for a given canvas size. Thumbnails show the frame alone;
@@ -229,6 +226,7 @@ export default function Home() {
   const [draft, setDraft] = useState<Stroke | null>(null);
   const [collabPulse, setCollabPulse] = useState(false);
   const [projectName, setProjectName] = useState("");
+  const [durationInput, setDurationInput] = useState("0+1");
   const [role, setRole] = useState<RoomRole>("connecting");
   const [peers, setPeers] = useState(0);
   const [busy, setBusy] = useState<{ label: string; ratio: number } | null>(null);
@@ -247,7 +245,9 @@ export default function Home() {
   const historyRef = useRef<Record<string, CutContent[]>>({});
   const redoRef = useRef<Record<string, CutContent[]>>({});
   const roomRef = useRef<Room | null>(null);
+  const roomIdRef = useRef<string | null>(null);
   const projectRef = useRef<Project>(project);
+  const projectNameRef = useRef(projectName);
   const previousRoleRef = useRef<RoomRole>("connecting");
 
   // While dragging a boundary the UI shows the pending position, not the committed one.
@@ -265,47 +265,88 @@ export default function Home() {
   const exportName = projectName.trim() || "storyboard";
 
   useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => { projectNameRef.current = projectName; }, [projectName]);
+  useEffect(() => { setDurationInput(formatFrameDuration(activeDuration)); }, [activeDuration, activeId]);
 
   /** Local edits go through here: the host owns state, guests only propose. */
   const mutate = useCallback((op: RoomOp) => {
+    const room = roomRef.current;
+    if (!room?.canEdit()) {
+      setToast("接続が完了してから編集してください");
+      return false;
+    }
     const next = applyOp(projectRef.current, op);
     projectRef.current = next;
     setProject(next);
-    const room = roomRef.current;
-    if (!room) return;
-    if (room.isHost()) room.broadcastSnapshot(next);
+    if (room.isHost()) room.broadcastSnapshot(next, projectNameRef.current);
     else room.sendOp(op);
+    return true;
   }, []);
 
+  const renameProject = useCallback((value: string) => {
+    const room = roomRef.current;
+    if (!room?.canEdit()) {
+      setToast("接続が完了してから編集してください");
+      return false;
+    }
+    projectNameRef.current = value;
+    setProjectName(value);
+    if (room.isHost()) room.broadcastSnapshot(projectRef.current, value);
+    else room.sendOp({ type: "rename", value });
+    return true;
+  }, []);
+
+  // Every connected participant keeps a room-scoped recovery copy. Guests
+  // receive the host's authoritative snapshots, so one can safely take over
+  // after the host disconnects and the room elects a replacement.
   useEffect(() => {
-    const stored = window.localStorage.getItem("conte-live-project");
-    if (!stored) return;
+    const roomId = roomIdRef.current;
+    if (role === "connecting" || !roomId) return;
     try {
-      const parsed = JSON.parse(stored) as { project?: Project; projectName?: string };
-      if (parsed.project?.cuts?.length) {
-        const restored = normalizeProject(parsed.project);
-        projectRef.current = restored;
-        setProject(restored);
-        setActiveId(restored.cuts[0].id);
-      }
-      if (parsed.projectName) setProjectName(parsed.projectName);
-    } catch { /* start from an empty board */ }
-  }, []);
-
-  // Only the host persists: it is the copy everyone else is mirroring.
-  useEffect(() => {
-    if (role !== "host") return;
-    window.localStorage.setItem("conte-live-project", JSON.stringify({ project, projectName }));
+      window.localStorage.setItem(roomStorageKey(roomId), JSON.stringify({ project, projectName }));
+    } catch {
+      setToast("端末の保存容量が足りないため、バックアップできませんでした");
+    }
   }, [project, projectName, role]);
 
   useEffect(() => {
     const url = new URL(window.location.href);
     let roomId = url.searchParams.get("room");
+    const isExistingRoom = Boolean(roomId);
     if (!roomId) {
       // A fresh visit opens its own room so boards are not shared by guessing the URL.
       roomId = Math.random().toString(36).slice(2, 10);
       url.searchParams.set("room", roomId);
       window.history.replaceState(null, "", url.toString());
+    }
+    roomIdRef.current = roomId;
+
+    // Storage used to be shared by every room. Move that data into the first
+    // existing room opened after this update, while keeping brand-new rooms blank.
+    const storageKey = roomStorageKey(roomId);
+    let stored = window.localStorage.getItem(storageKey);
+    if (!stored && isExistingRoom) {
+      const legacy = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacy) {
+        stored = legacy;
+        window.localStorage.setItem(storageKey, legacy);
+        window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+      }
+    }
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as { project?: Project; projectName?: string };
+        if (parsed.project?.cuts?.length) {
+          const restored = normalizeProject(parsed.project);
+          projectRef.current = restored;
+          setProject(restored);
+          setActiveId(restored.cuts[0].id);
+        }
+        if (parsed.projectName) {
+          projectNameRef.current = parsed.projectName;
+          setProjectName(parsed.projectName);
+        }
+      } catch { /* start this room from an empty board */ }
     }
 
     const pulse = () => {
@@ -318,19 +359,28 @@ export default function Home() {
       onStatus: setToast,
       onPeers: setPeers,
       onSnapshot: (incoming) => {
-        projectRef.current = incoming;
-        setProject(incoming);
-        setActiveId((current) => (incoming.cuts.some((cut) => cut.id === current) ? current : incoming.cuts[0]?.id || current));
+        projectRef.current = incoming.project;
+        projectNameRef.current = incoming.projectName;
+        setProject(incoming.project);
+        setProjectName(incoming.projectName);
+        setActiveId((current) => (incoming.project.cuts.some((cut) => cut.id === current) ? current : incoming.project.cuts[0]?.id || current));
         pulse();
       },
       onOp: (op) => {
+        if (op.type === "rename") {
+          projectNameRef.current = op.value;
+          setProjectName(op.value);
+          roomRef.current?.broadcastSnapshot(projectRef.current, op.value);
+          pulse();
+          return;
+        }
         const next = applyOp(projectRef.current, op);
         projectRef.current = next;
         setProject(next);
-        roomRef.current?.broadcastSnapshot(next);
+        roomRef.current?.broadcastSnapshot(next, projectNameRef.current);
         pulse();
       },
-      getSnapshot: () => projectRef.current,
+      getSnapshot: () => ({ project: projectRef.current, projectName: projectNameRef.current }),
     });
     roomRef.current = room;
     room.connect();
@@ -364,9 +414,9 @@ export default function Home() {
 
   // Playback position is intentionally local: every participant scrubs independently.
   useEffect(() => {
-    const found = cuts[cutIndexAt(project, currentTime)]?.id;
+    const found = project.cuts[cutIndexAt(project, currentTime)]?.id;
     if (found && found !== activeId) setActiveId(found);
-  }, [currentTime, project]);
+  }, [activeId, currentTime, project]);
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = volume;
@@ -377,7 +427,6 @@ export default function Home() {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
       return;
     }
-    playStartRef.current = { at: performance.now(), time: currentTime };
     const tick = () => {
       const audio = audioRef.current;
       const next = audioUrl && audio && !audio.paused
@@ -421,6 +470,7 @@ export default function Home() {
     }
     const from = currentTime >= totalDuration ? 0 : currentTime;
     if (from !== currentTime) seek(0);
+    playStartRef.current = { at: performance.now(), time: from };
     setPlaying(true);
     if (audioUrl && audioRef.current) {
       audioRef.current.currentTime = from;
@@ -439,6 +489,10 @@ export default function Home() {
   };
 
   const beginStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!roomRef.current?.canEdit()) {
+      setToast("接続が完了してから編集してください");
+      return;
+    }
     event.currentTarget.setPointerCapture(event.pointerId);
     setDraft({ color, size: selectedTool === "eraser" ? brushSize * 4 : brushSize, eraser: selectedTool === "eraser", points: [pointerPoint(event)] });
   };
@@ -451,9 +505,10 @@ export default function Home() {
 
   const endStroke = () => {
     if (!draft) return;
-    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
-    redoRef.current[activeId] = [];
-    mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] });
+    if (mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] })) {
+      historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
+      redoRef.current[activeId] = [];
+    }
     setDraft(null);
   };
 
@@ -461,28 +516,31 @@ export default function Home() {
     const cut = projectRef.current.cuts.find((c) => c.id === activeId);
     const history = historyRef.current[activeId] || [];
     if (!cut || !history.length) return;
-    redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cutContent(cut)];
-    historyRef.current[activeId] = history.slice(0, -1);
-    mutate({ type: "content", cutId: activeId, ...history[history.length - 1] });
+    if (mutate({ type: "content", cutId: activeId, ...history[history.length - 1] })) {
+      redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cutContent(cut)];
+      historyRef.current[activeId] = history.slice(0, -1);
+    }
   }, [activeId, mutate]);
 
   const redo = useCallback(() => {
     const cut = projectRef.current.cuts.find((c) => c.id === activeId);
     const redoStack = redoRef.current[activeId] || [];
     if (!cut || !redoStack.length) return;
-    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(cut)];
-    redoRef.current[activeId] = redoStack.slice(0, -1);
-    mutate({ type: "content", cutId: activeId, ...redoStack[redoStack.length - 1] });
+    if (mutate({ type: "content", cutId: activeId, ...redoStack[redoStack.length - 1] })) {
+      historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(cut)];
+      redoRef.current[activeId] = redoStack.slice(0, -1);
+    }
   }, [activeId, mutate]);
 
   const pasteImageBlob = useCallback(async (blob: Blob) => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     if (!cut) return;
     const backgroundImage = await clipboardImageDataUrl(blob);
-    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-    redoRef.current[cut.id] = [];
-    mutate({ type: "content", cutId: cut.id, strokes: cut.strokes, backgroundImage });
-    setToast("クリップボードの画像を貼り付けました");
+    if (mutate({ type: "content", cutId: cut.id, strokes: cut.strokes, backgroundImage })) {
+      historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
+      redoRef.current[cut.id] = [];
+      setToast("クリップボードの画像を貼り付けました");
+    }
   }, [activeId, mutate]);
 
   const pasteFromClipboard = useCallback(async () => {
@@ -524,17 +582,18 @@ export default function Home() {
       return;
     }
     if (!window.confirm("現在のカットの描画と貼り付け画像をすべて消去しますか？")) return;
-    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-    redoRef.current[cut.id] = [];
-    mutate({ type: "content", cutId: cut.id, strokes: [] });
-    setDraft(null);
-    setToast("現在のカットを全消去しました（元に戻せます）");
+    if (mutate({ type: "content", cutId: cut.id, strokes: [] })) {
+      historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
+      redoRef.current[cut.id] = [];
+      setDraft(null);
+      setToast("現在のカットを全消去しました（元に戻せます）");
+    }
   }, [activeId, mutate]);
 
   /** Cuts are created by splitting the song at the playhead, never by appending a length. */
   const splitAtPlayhead = useCallback(() => {
     const current = projectRef.current;
-    if (currentTime <= MIN_CUT_DURATION || currentTime >= current.duration - MIN_CUT_DURATION) {
+    if (currentTime < MIN_CUT_DURATION || currentTime > current.duration - MIN_CUT_DURATION) {
       setToast("この位置では分割できません");
       return;
     }
@@ -543,9 +602,10 @@ export default function Home() {
       return;
     }
     const id = newCutId();
-    mutate({ type: "split", at: currentTime, id });
-    setActiveId(id);
-    setToast(`${formatTime(currentTime)} で分割しました`);
+    if (mutate({ type: "split", at: currentTime, id })) {
+      setActiveId(id);
+      setToast(`${formatFramePosition(currentTime)} で分割しました`);
+    }
   }, [currentTime, mutate]);
 
   const deleteCut = useCallback(() => {
@@ -554,9 +614,10 @@ export default function Home() {
       return;
     }
     const remaining = projectRef.current.cuts.filter((cut) => cut.id !== activeId);
-    mutate({ type: "delete", cutId: activeId });
-    setActiveId(remaining[Math.max(0, Math.min(activeIndex, remaining.length - 1))].id);
-    setToast("カットを削除しました");
+    if (mutate({ type: "delete", cutId: activeId })) {
+      setActiveId(remaining[Math.max(0, Math.min(activeIndex, remaining.length - 1))].id);
+      setToast("カットを削除しました");
+    }
   }, [activeId, activeIndex, mutate]);
 
   const updateActive = (patch: { title?: string; note?: string }) =>
@@ -569,6 +630,16 @@ export default function Home() {
     mutate({ type: "move", cutId: next.id, start: activeCut.start + Math.max(MIN_CUT_DURATION, seconds) });
   };
 
+  const commitDurationInput = () => {
+    const seconds = parseFrameDuration(durationInput);
+    if (seconds === null) {
+      setDurationInput(formatFrameDuration(activeDuration));
+      setToast(`尺は「秒+コマ」で入力してください（24fps、最小 0+1）`);
+      return;
+    }
+    updateActiveDuration(seconds);
+  };
+
   const chooseCut = useCallback((index: number) => {
     const cut = projectRef.current.cuts[index];
     if (!cut) return;
@@ -579,6 +650,11 @@ export default function Home() {
   const onAudio = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    if (!roomRef.current?.canEdit()) {
+      event.target.value = "";
+      setToast("接続が完了してから音源を読み込んでください");
+      return;
+    }
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     const url = URL.createObjectURL(file);
     setAudioUrl(url);
@@ -591,7 +667,7 @@ export default function Home() {
     probe.onloadedmetadata = () => {
       if (!Number.isFinite(probe.duration) || probe.duration <= 0) return;
       mutate({ type: "duration", value: probe.duration });
-      setToast(`楽曲に合わせて全体を ${formatTime(probe.duration)} にしました`);
+      setToast(`楽曲に合わせて全体を ${formatFramePosition(probe.duration)} にしました`);
     };
   };
 
@@ -617,8 +693,8 @@ export default function Home() {
     if (!files?.length) return;
     try {
       const bundle = from === "zip" ? await readBundleFromZip(files[0]) : await readBundleFromFiles(files);
-      mutate({ type: "replace", project: bundle.project });
-      if (bundle.projectName) setProjectName(bundle.projectName);
+      if (!mutate({ type: "replace", project: bundle.project })) return;
+      if (bundle.projectName) renameProject(bundle.projectName);
       setActiveId(bundle.project.cuts[0].id);
       historyRef.current = {};
       redoRef.current = {};
@@ -630,6 +706,16 @@ export default function Home() {
       setToast(error instanceof Error ? error.message : "読み込みに失敗しました");
     } finally {
       event.target.value = "";
+    }
+  };
+
+  const shareRoom = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+      await navigator.clipboard.writeText(location.href);
+      setToast("招待リンクをコピーしました");
+    } catch {
+      setToast("招待リンクをコピーできませんでした。URL欄からコピーしてください");
     }
   };
 
@@ -725,11 +811,11 @@ export default function Home() {
     return { lower, upper };
   }, []);
 
-  const timeAtClientX = (clientX: number) => {
+  const timeAtClientX = useCallback((clientX: number) => {
     const rect = timelineRef.current?.getBoundingClientRect();
     if (!rect) return 0;
     return ((clientX - rect.left) / rect.width) * totalDuration;
-  };
+  }, [totalDuration]);
 
   // Dragging the timeline scrubs the playhead. Tracked on the window so the
   // drag keeps working once the pointer leaves the timeline.
@@ -748,8 +834,7 @@ export default function Home() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scrubbing, seek, totalDuration]);
+  }, [scrubbing, seek, timeAtClientX]);
 
   const beginBoundaryDrag = (event: ReactPointerEvent<HTMLButtonElement>, index: number) => {
     event.stopPropagation();
@@ -770,8 +855,9 @@ export default function Home() {
       setDrag((current) => (current ? { ...current, start } : current));
     };
     const onUp = () => {
-      mutate({ type: "move", cutId: drag.cutId, start: drag.start });
-      setToast(`区切りを ${formatTime(drag.start)} に移動しました`);
+      if (mutate({ type: "move", cutId: drag.cutId, start: drag.start })) {
+        setToast(`区切りを ${formatFramePosition(drag.start)} に移動しました`);
+      }
       setDrag(null);
     };
     window.addEventListener("pointermove", onMove);
@@ -782,7 +868,7 @@ export default function Home() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [drag, boundaryRange, mutate, totalDuration]);
+  }, [drag, boundaryRange, mutate, timeAtClientX]);
 
   /** Keyboard equivalent of dragging, so boundaries are reachable without a pointer. */
   const nudgeBoundary = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -807,8 +893,14 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">C</span><span>CONTE</span><b>LIVE</b></div>
         <div className="project-title">
           <button className="crumb">Projects</button><span>/</span>
-          <input aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
-          <span className="saved"><i />{role === "host" ? "この端末に保存" : "ホストが保存中"}</span>
+          <input aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName}
+            onChange={(e) => renameProject(e.target.value)} disabled={role === "connecting"} />
+          <span className="saved"><i />{
+            role === "host" ? "この端末に保存"
+              : role === "guest" ? "同期＋バックアップ"
+                : role === "closed" ? "この端末にバックアップ"
+                  : "接続中"
+          }</span>
         </div>
         <div className="export-actions">
           <button onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
@@ -825,7 +917,7 @@ export default function Home() {
         <div className="people" aria-label="参加中のメンバー">
           <span className="presence-text" title={ROLE_LABEL[role]}><i className={collabPulse ? "pulse" : ""} />{ROLE_LABEL[role]}</span>
           <div className="avatars"><span className="av av1">YOU</span>{peers > 0 && <span className="av av2">+{peers}</span>}</div>
-          <button className="share" onClick={() => { navigator.clipboard?.writeText(location.href); setToast("招待リンクをコピーしました"); }}>招待する</button>
+          <button className="share" onClick={() => void shareRoom()}>招待する</button>
         </div>
       </header>
 
@@ -839,7 +931,7 @@ export default function Home() {
                 <span className="thumb"><MiniCanvas strokes={cut.strokes} backgroundImage={cut.backgroundImage} />{cut.strokes.length === 0 && !cut.backgroundImage && <span className={`placeholder p${index % 4}`} />}</span>
                 <span className="cut-copy">
                   <strong className={cut.title.trim() ? "" : "untitled"}>{cutLabel(cut.title, index)}</strong>
-                  <small>{cutDurationOf(displayProject, index).toFixed(1)}秒 · {formatTime(cut.start)}</small>
+                  <small>{formatFrameDuration(cutDurationOf(displayProject, index))} · {formatFramePosition(cut.start)}</small>
                 </span>
               </button>
             ))}
@@ -875,9 +967,13 @@ export default function Home() {
               <label>カット名<input placeholder={cutLabel("", activeIndex)} value={activeCut.title} onChange={(e) => updateActive({ title: e.target.value })} /></label>
               <label>尺
                 <div className="duration-field">
-                  <input type="number" min={MIN_CUT_DURATION} step="0.1" value={activeDuration.toFixed(2)} disabled={isLastCut}
-                    onChange={(e) => updateActiveDuration(Number(e.target.value))} />
-                  <span>秒</span>
+                  <input type="text" inputMode="numeric" value={durationInput} disabled={isLastCut || role === "connecting"}
+                    aria-label="尺（秒+コマ）" onChange={(e) => setDurationInput(e.target.value)} onBlur={commitDurationInput}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") e.currentTarget.blur();
+                      if (e.key === "Escape") setDurationInput(formatFrameDuration(activeDuration));
+                    }} />
+                  <span>24fps</span>
                 </div>
               </label>
               {isLastCut && <p className="field-hint">最後のカットは楽曲の終わりまでです</p>}
@@ -895,7 +991,7 @@ export default function Home() {
             <button onClick={() => seek(currentTime - 1)} title="1秒戻す (←)">−1s</button>
             <button className="play" onClick={togglePlay} aria-label={playing ? "停止" : "再生"} title="再生 / 停止 (Space)">{playing ? "Ⅱ" : "▶"}</button>
             <button onClick={() => seek(currentTime + 1)} title="1秒進める (→)">+1s</button>
-            <span className="timecode">{formatTime(currentTime)} <small>/ {formatTime(totalDuration)}</small></span>
+            <span className="timecode">{formatFramePosition(currentTime)} <small>/ {formatFramePosition(totalDuration)}</small></span>
           </div>
           <div className="audio-info">
             <span className="wave-icon">≋</span>
@@ -921,7 +1017,7 @@ export default function Home() {
           <div className="track-labels"><span>VIDEO</span><span>AUDIO</span></div>
           <div className="timeline-viewport" ref={viewportRef}>
             <div className={`timeline ${scrubbing ? "scrubbing" : ""}`} ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
-              <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatTime(v * totalDuration).slice(0, 5)}</span>)}</div>
+              <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatFramePosition(v * totalDuration)}</span>)}</div>
               <div className="video-track">
                 {cuts.map((cut, index) => (
                   <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""}`}
@@ -936,7 +1032,7 @@ export default function Home() {
                 return (
                   <button key={`handle-${cut.id}`} className={`cut-handle ${drag?.cutId === cut.id ? "dragging" : ""}`}
                     style={{ left: `${(cut.start / totalDuration) * 100}%` }}
-                    title={`${cutLabel(cut.title, index)} の開始位置 ${formatTime(cut.start)}`}
+                    title={`${cutLabel(cut.title, index)} の開始位置 ${formatFramePosition(cut.start)}`}
                     aria-label={`カット${index + 1}の開始位置を調整`}
                     onPointerDown={(e) => beginBoundaryDrag(e, index)}
                     onKeyDown={(e) => nudgeBoundary(e, index)}

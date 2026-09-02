@@ -4,6 +4,7 @@ export type RoomOp =
   | { type: "strokes"; cutId: string; strokes: Stroke[] }
   | { type: "content"; cutId: string; strokes: Stroke[]; backgroundImage?: string }
   | { type: "patch"; cutId: string; patch: { title?: string; note?: string } }
+  | { type: "rename"; value: string }
   /** Insert a cut boundary at a point on the song timeline. */
   | { type: "split"; at: number; id: string }
   /** Move an existing boundary, which resizes the cut before it. */
@@ -15,16 +16,17 @@ export type RoomOp =
   | { type: "replace"; project: Project };
 
 export type RoomRole = "connecting" | "host" | "guest" | "closed";
+export type RoomSnapshot = { project: Project; projectName: string };
 
 export type RoomHandlers = {
   onRole: (role: RoomRole) => void;
   onStatus: (text: string) => void;
   onPeers: (count: number) => void;
   /** Guest side: authoritative project pushed by the host. */
-  onSnapshot: (project: Project) => void;
+  onSnapshot: (snapshot: RoomSnapshot) => void;
   /** Host side: an edit proposed by a guest. */
   onOp: (op: RoomOp) => void;
-  getSnapshot: () => Project;
+  getSnapshot: () => RoomSnapshot;
 };
 
 const ICE_SERVERS: RTCIceServer[] = [
@@ -75,10 +77,17 @@ export class Room {
     return this.role === "host";
   }
 
+  /** Closed rooms remain locally editable; guests wait for the data channel. */
+  canEdit() {
+    if (this.role === "host" || this.role === "closed") return true;
+    if (this.role !== "guest" || !this.hostId) return false;
+    return this.links.get(this.hostId)?.channel?.readyState === "open";
+  }
+
   /** Host: push the authoritative project to every guest. */
-  broadcastSnapshot(project: Project) {
+  broadcastSnapshot(project: Project, projectName: string) {
     if (this.role !== "host") return;
-    const payload = JSON.stringify({ type: "snapshot", project });
+    const payload = JSON.stringify({ type: "snapshot", project, projectName });
     this.links.forEach((link) => {
       if (link.channel?.readyState === "open") link.channel.send(payload);
     });
@@ -160,15 +169,17 @@ export class Room {
     channel.onopen = () => {
       this.handlers.onPeers(this.links.size);
       if (this.role === "host") {
-        channel.send(JSON.stringify({ type: "snapshot", project: this.handlers.getSnapshot() }));
+        channel.send(JSON.stringify({ type: "snapshot", ...this.handlers.getSnapshot() }));
         this.handlers.onStatus("参加者が入室しました");
       } else {
         this.handlers.onStatus("ホストに接続しました");
       }
     };
     channel.onmessage = (event) => {
-      const data = JSON.parse(event.data as string) as { type: string; project?: Project; op?: RoomOp };
-      if (data.type === "snapshot" && data.project && this.role === "guest") this.handlers.onSnapshot(data.project);
+      const data = JSON.parse(event.data as string) as { type: string; project?: Project; projectName?: string; op?: RoomOp };
+      if (data.type === "snapshot" && data.project && this.role === "guest") {
+        this.handlers.onSnapshot({ project: data.project, projectName: data.projectName || "" });
+      }
       if (data.type === "op" && data.op && this.role === "host") this.handlers.onOp(data.op);
     };
     channel.onclose = () => this.handlers.onPeers(this.links.size);
@@ -250,7 +261,7 @@ export function applyOp(project: Project, op: RoomOp): Project {
 
   if (op.type === "split") {
     const at = op.at;
-    if (at <= MIN_CUT_DURATION || at >= project.duration - MIN_CUT_DURATION) return project;
+    if (at < MIN_CUT_DURATION || at > project.duration - MIN_CUT_DURATION) return project;
     if (project.cuts.some((cut) => Math.abs(cut.start - at) < MIN_CUT_DURATION)) return project;
     // The new cut is a fresh blank frame starting at the split point.
     const cut = { id: op.id || newCutId(), title: "", note: "", start: at, strokes: [] };
