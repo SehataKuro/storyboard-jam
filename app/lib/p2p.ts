@@ -2,6 +2,7 @@ import { MIN_CUT_DURATION, Project, Stroke, newCutId, normalizeProject } from ".
 
 export type RoomOp =
   | { type: "strokes"; cutId: string; strokes: Stroke[] }
+  | { type: "content"; cutId: string; strokes: Stroke[]; backgroundImage?: string }
   | { type: "patch"; cutId: string; patch: { title?: string; note?: string } }
   /** Insert a cut boundary at a point on the song timeline. */
   | { type: "split"; at: number; id: string }
@@ -222,6 +223,15 @@ export class Room {
 export function applyOp(project: Project, op: RoomOp): Project {
   if (op.type === "strokes") {
     return { ...project, cuts: project.cuts.map((cut) => (cut.id === op.cutId ? { ...cut, strokes: op.strokes } : cut)) };
+  }
+
+  if (op.type === "content") {
+    return {
+      ...project,
+      cuts: project.cuts.map((cut) => (cut.id === op.cutId
+        ? { ...cut, strokes: op.strokes, backgroundImage: op.backgroundImage }
+        : cut)),
+    };
   }
 
   if (op.type === "patch") {

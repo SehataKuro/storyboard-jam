@@ -13,6 +13,7 @@ import {
   Point,
   Project,
   Stroke,
+  Cut,
   createEmptyProject,
   cutDurationOf,
   cutIndexAt,
@@ -24,7 +25,7 @@ import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
 import { readBundleFromFiles, readBundleFromZip } from "./lib/project-io";
-import { STROKE_REFERENCE_WIDTH, paintStrokes } from "./lib/render";
+import { STROKE_REFERENCE_WIDTH, canvasToPngBlob, drawContainedImage, renderCutToCanvas } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
 
@@ -36,6 +37,7 @@ const SHORTCUTS: [string, string][] = [
   ["← / →", "1秒移動（Shiftで1フレーム）"],
   [", / .", "前 / 次のカットへ"],
   ["Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直す"],
+  ["Ctrl+V", "画像を現在のカットへ貼り付け"],
   ["Delete", "選択中のカットを削除"],
   ["?", "このヘルプ"],
 ];
@@ -59,6 +61,42 @@ function frameBox(width: number, height: number, withMargin: boolean) {
 }
 
 const MAX_STAGE_WIDTH = 1120;
+type CutContent = Pick<Cut, "strokes" | "backgroundImage">;
+
+const cutContent = (cut: Cut): CutContent => ({
+  strokes: cut.strokes,
+  backgroundImage: cut.backgroundImage,
+});
+
+async function clipboardImageDataUrl(blob: Blob) {
+  const image = await createImageBitmap(blob);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = EXPORT_WIDTH;
+    canvas.height = EXPORT_HEIGHT;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("貼り付け画像を処理できませんでした");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawContainedImage(ctx, image, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/webp", 0.92);
+  } finally {
+    image.close();
+  }
+}
+
+function useLoadedImage(source?: string) {
+  const [loaded, setLoaded] = useState<{ source: string; image: HTMLImageElement } | null>(null);
+  useEffect(() => {
+    if (!source) return;
+    let cancelled = false;
+    const next = new Image();
+    next.onload = () => { if (!cancelled) setLoaded({ source, image: next }); };
+    next.src = source;
+    return () => { cancelled = true; };
+  }, [source]);
+  return loaded && loaded.source === source ? loaded.image : null;
+}
 
 /**
  * Sizes the stage to fit its padded container while keeping the frame-plus-margin ratio.
@@ -82,7 +120,13 @@ function fitCanvas(canvas: HTMLCanvasElement) {
   canvas.style.height = `${height}px`;
 }
 
-function drawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], draft?: Stroke | null, thumbnail = false) {
+function drawCanvas(
+  canvas: HTMLCanvasElement,
+  strokes: Stroke[],
+  backgroundImage: HTMLImageElement | null,
+  draft?: Stroke | null,
+  thumbnail = false,
+) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   if (!thumbnail) fitCanvas(canvas);
@@ -100,6 +144,9 @@ function drawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], draft?: Stroke
   ctx.fillRect(0, 0, width, height);
 
   const frame = frameBox(width, height, !thumbnail);
+  if (backgroundImage) {
+    drawContainedImage(ctx, backgroundImage, frame.left, frame.top, frame.width, frame.height);
+  }
 
   if (!thumbnail) {
     ctx.strokeStyle = "rgba(54, 49, 41, .10)";
@@ -148,11 +195,12 @@ function drawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], draft?: Stroke
   }
 }
 
-function MiniCanvas({ strokes }: { strokes: Stroke[] }) {
+function MiniCanvas({ strokes, backgroundImage }: { strokes: Stroke[]; backgroundImage?: string }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const image = useLoadedImage(backgroundImage);
   useEffect(() => {
-    if (ref.current) drawCanvas(ref.current, strokes, null, true);
-  }, [strokes]);
+    if (ref.current) drawCanvas(ref.current, strokes, image, null, true);
+  }, [strokes, image]);
   return <canvas ref={ref} className="mini-canvas" aria-hidden="true" />;
 }
 
@@ -196,8 +244,8 @@ export default function Home() {
   const dragIndexRef = useRef(-1);
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
-  const historyRef = useRef<Record<string, Stroke[][]>>({});
-  const redoRef = useRef<Record<string, Stroke[][]>>({});
+  const historyRef = useRef<Record<string, CutContent[]>>({});
+  const redoRef = useRef<Record<string, CutContent[]>>({});
   const roomRef = useRef<Room | null>(null);
   const projectRef = useRef<Project>(project);
   const previousRoleRef = useRef<RoomRole>("connecting");
@@ -211,6 +259,7 @@ export default function Home() {
   const totalDuration = displayProject.duration;
   const activeIndex = Math.max(0, cuts.findIndex((cut) => cut.id === activeId));
   const activeCut = cuts[activeIndex] || cuts[0];
+  const activeBackgroundImage = useLoadedImage(activeCut?.backgroundImage);
   const activeDuration = cutDurationOf(displayProject, activeIndex);
   const isLastCut = activeIndex === cuts.length - 1;
   const exportName = projectName.trim() || "storyboard";
@@ -302,16 +351,16 @@ export default function Home() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !activeCut) return;
-    drawCanvas(canvas, activeCut.strokes, draft);
-  }, [activeCut, draft, panelOpen]);
+    drawCanvas(canvas, activeCut.strokes, activeBackgroundImage, draft);
+  }, [activeCut, activeBackgroundImage, draft, panelOpen]);
 
   useEffect(() => {
     const onResize = () => {
-      if (canvasRef.current && activeCut) drawCanvas(canvasRef.current, activeCut.strokes, draft);
+      if (canvasRef.current && activeCut) drawCanvas(canvasRef.current, activeCut.strokes, activeBackgroundImage, draft);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, [activeCut, draft]);
+  }, [activeCut, activeBackgroundImage, draft]);
 
   // Playback position is intentionally local: every participant scrubs independently.
   useEffect(() => {
@@ -402,7 +451,7 @@ export default function Home() {
 
   const endStroke = () => {
     if (!draft) return;
-    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), activeCut.strokes];
+    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
     redoRef.current[activeId] = [];
     mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] });
     setDraft(null);
@@ -412,18 +461,74 @@ export default function Home() {
     const cut = projectRef.current.cuts.find((c) => c.id === activeId);
     const history = historyRef.current[activeId] || [];
     if (!cut || !history.length) return;
-    redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cut.strokes];
+    redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cutContent(cut)];
     historyRef.current[activeId] = history.slice(0, -1);
-    mutate({ type: "strokes", cutId: activeId, strokes: history[history.length - 1] });
+    mutate({ type: "content", cutId: activeId, ...history[history.length - 1] });
   }, [activeId, mutate]);
 
   const redo = useCallback(() => {
     const cut = projectRef.current.cuts.find((c) => c.id === activeId);
     const redoStack = redoRef.current[activeId] || [];
     if (!cut || !redoStack.length) return;
-    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cut.strokes];
+    historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(cut)];
     redoRef.current[activeId] = redoStack.slice(0, -1);
-    mutate({ type: "strokes", cutId: activeId, strokes: redoStack[redoStack.length - 1] });
+    mutate({ type: "content", cutId: activeId, ...redoStack[redoStack.length - 1] });
+  }, [activeId, mutate]);
+
+  const pasteImageBlob = useCallback(async (blob: Blob) => {
+    const cut = projectRef.current.cuts.find((item) => item.id === activeId);
+    if (!cut) return;
+    const backgroundImage = await clipboardImageDataUrl(blob);
+    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
+    redoRef.current[cut.id] = [];
+    mutate({ type: "content", cutId: cut.id, strokes: cut.strokes, backgroundImage });
+    setToast("クリップボードの画像を貼り付けました");
+  }, [activeId, mutate]);
+
+  const pasteFromClipboard = useCallback(async () => {
+    if (!navigator.clipboard?.read) {
+      setToast("このブラウザではボタンから読めません。Ctrl+Vで貼り付けてください");
+      return;
+    }
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const imageType = item.types.find((type) => type.startsWith("image/"));
+        if (!imageType) continue;
+        await pasteImageBlob(await item.getType(imageType));
+        return;
+      }
+      setToast("クリップボードに画像がありません");
+    } catch {
+      setToast("クリップボードを読めませんでした。Ctrl+Vをお試しください");
+    }
+  }, [pasteImageBlob]);
+
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      const image = Array.from(event.clipboardData?.items || [])
+        .find((item) => item.type.startsWith("image/"))
+        ?.getAsFile();
+      if (!image) return;
+      event.preventDefault();
+      void pasteImageBlob(image).catch(() => setToast("画像の貼り付けに失敗しました"));
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [pasteImageBlob]);
+
+  const clearActiveCut = useCallback(() => {
+    const cut = projectRef.current.cuts.find((item) => item.id === activeId);
+    if (!cut || (!cut.strokes.length && !cut.backgroundImage)) {
+      setToast("現在のカットに消去する絵がありません");
+      return;
+    }
+    if (!window.confirm("現在のカットの描画と貼り付け画像をすべて消去しますか？")) return;
+    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
+    redoRef.current[cut.id] = [];
+    mutate({ type: "content", cutId: cut.id, strokes: [] });
+    setDraft(null);
+    setToast("現在のカットを全消去しました（元に戻せます）");
   }, [activeId, mutate]);
 
   /** Cuts are created by splitting the song at the playhead, never by appending a length. */
@@ -490,18 +595,20 @@ export default function Home() {
     };
   };
 
-  const exportFrame = () => {
-    const canvas = document.createElement("canvas");
-    canvas.width = EXPORT_WIDTH;
-    canvas.height = EXPORT_HEIGHT;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    paintStrokes(ctx, activeCut.strokes, EXPORT_WIDTH, EXPORT_HEIGHT);
-    const link = document.createElement("a");
-    link.download = `${cutLabel(activeCut.title, activeIndex)}.png`;
-    link.href = canvas.toDataURL("image/png");
-    link.click();
-    setToast("現在のカットを書き出しました");
+  const exportFrame = async () => {
+    try {
+      const canvas = await renderCutToCanvas(
+        activeCut.strokes,
+        EXPORT_WIDTH,
+        EXPORT_HEIGHT,
+        activeCut.backgroundImage,
+      );
+      const blob = await canvasToPngBlob(canvas);
+      downloadBlob(blob, `${cutLabel(activeCut.title, activeIndex)}.png`);
+      setToast("現在のカットを書き出しました");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "PNGの書き出しに失敗しました");
+    }
   };
 
   /** Restores a board from an exported bundle: the ZIP itself or its extracted folder. */
@@ -729,7 +836,7 @@ export default function Home() {
             {cuts.map((cut, index) => (
               <button key={cut.id} className={`cut-card ${cut.id === activeId ? "active" : ""}`} onClick={() => chooseCut(index)}>
                 <span className="cut-no">{String(index + 1).padStart(2, "0")}</span>
-                <span className="thumb"><MiniCanvas strokes={cut.strokes} />{cut.strokes.length === 0 && <span className={`placeholder p${index % 4}`} />}</span>
+                <span className="thumb"><MiniCanvas strokes={cut.strokes} backgroundImage={cut.backgroundImage} />{cut.strokes.length === 0 && !cut.backgroundImage && <span className={`placeholder p${index % 4}`} />}</span>
                 <span className="cut-copy">
                   <strong className={cut.title.trim() ? "" : "untitled"}>{cutLabel(cut.title, index)}</strong>
                   <small>{cutDurationOf(displayProject, index).toFixed(1)}秒 · {formatTime(cut.start)}</small>
@@ -752,6 +859,8 @@ export default function Home() {
             </div>
             <div className="history-tools">
               <button onClick={undo} title="元に戻す (Ctrl+Z)">↶</button><button onClick={redo} title="やり直す (Ctrl+Shift+Z)">↷</button>
+              <button className="text-tool" onClick={() => void pasteFromClipboard()} title="クリップボードの画像を貼り付け (Ctrl+V)">貼り付け</button>
+              <button className="text-tool danger" onClick={clearActiveCut} title="現在のカットの絵をすべて消去">全消去</button>
               <button className="panel-toggle" onClick={() => setPanelOpen((v) => !v)}>{panelOpen ? "メモを閉じる" : "メモを開く"}</button>
             </div>
           </div>
@@ -774,7 +883,7 @@ export default function Home() {
               {isLastCut && <p className="field-hint">最後のカットは楽曲の終わりまでです</p>}
               <label>演出メモ<textarea value={activeCut.note} onChange={(e) => updateActive({ note: e.target.value })} /></label>
               <div className="tag-row"><span>CAM</span><button>FIX</button><button>PAN →</button><button>＋</button></div>
-              <div className="note-actions"><button onClick={splitAtPlayhead}>分割</button><button onClick={exportFrame}>PNG</button><button className="danger" onClick={deleteCut}>削除</button></div>
+              <div className="note-actions"><button onClick={splitAtPlayhead}>分割</button><button onClick={() => void exportFrame()}>PNG</button><button className="danger" onClick={deleteCut}>削除</button></div>
             </aside>}
           </div>
         </section>

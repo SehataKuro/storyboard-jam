@@ -28,7 +28,7 @@ export async function exportSequenceZip(project: Project, options: ExportOptions
 
   for (let index = 0; index < cuts.length; index += 1) {
     onProgress?.(index / cuts.length, `カット ${index + 1}/${cuts.length} を描画中`);
-    const canvas = renderCutToCanvas(cuts[index].strokes, width, height);
+    const canvas = await renderCutToCanvas(cuts[index].strokes, width, height, cuts[index].backgroundImage);
     const blob = await canvasToPngBlob(canvas);
     entries.push({ name: imagePath(index), data: new Uint8Array(await blob.arrayBuffer()) });
   }
@@ -134,7 +134,7 @@ export async function exportMovie(project: Project, audioFile: File | null, opti
   for (let index = 0; index < cuts.length; index += 1) {
     const startFrame = frameAt(cuts[index].start, fps);
     const endFrame = index === cuts.length - 1 ? totalFrames : frameAt(cutEndOf(project, index), fps);
-    const canvas = renderCutToCanvas(cuts[index].strokes, width, height);
+    const canvas = await renderCutToCanvas(cuts[index].strokes, width, height, cuts[index].backgroundImage);
 
     for (let frame = startFrame; frame < endFrame; frame += 1) {
       // Keep the encoder queue shallow so memory stays flat on long boards.

@@ -5,7 +5,15 @@ export type Stroke = { color: string; size: number; points: Point[]; eraser?: bo
  * A cut is a boundary on the song timeline, not a length of its own.
  * The cut runs from its own `start` to the next cut's `start` (or to the end of the song).
  */
-export type Cut = { id: string; title: string; note: string; start: number; strokes: Stroke[] };
+export type Cut = {
+  id: string;
+  title: string;
+  note: string;
+  start: number;
+  strokes: Stroke[];
+  /** A clipboard image placed underneath the pen strokes. */
+  backgroundImage?: string;
+};
 
 /** The shared project: the song length owns the total, cuts partition it. */
 export type Project = { duration: number; cuts: Cut[] };
@@ -57,7 +65,7 @@ export function normalizeProject(project: Project): Project {
     const floor = previous ? previous.start + MIN_CUT_DURATION : 0;
     const start = cuts.length === 0 ? 0 : Math.min(Math.max(cut.start, floor), duration - MIN_CUT_DURATION);
     if (previous && start - previous.start < MIN_CUT_DURATION) return;
-    cuts.push({ ...cut, start });
+    cuts.push({ ...cut, start, strokes: Array.isArray(cut.strokes) ? cut.strokes : [] });
   });
   return { duration, cuts: cuts.length ? cuts : createEmptyProject(duration).cuts };
 }
