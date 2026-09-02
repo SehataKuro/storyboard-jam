@@ -19,7 +19,7 @@ const eslintConfig = defineConfig([
   ...tseslint.configs.recommended,
   react.configs.flat.recommended,
   react.configs.flat["jsx-runtime"],
-  reactHooks.configs.flat["recommended-latest"],
+  reactHooks.configs["recommended-latest"],
   jsxA11y.flatConfigs.recommended,
   next.configs["core-web-vitals"],
   {
