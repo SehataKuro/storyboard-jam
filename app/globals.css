@@ -132,3 +132,10 @@ button { cursor:pointer; }
 .help-card dd { margin:0; font-size:11px; color:#5b554c; }
 .help-card > button { margin-top:18px; width:100%; border:1px solid var(--line); background:#fffefa; border-radius:7px; padding:8px; font-size:11px; font-weight:700; }
 @media (max-width:680px) { .volume-control { display:none; } .help-card dl div { grid-template-columns:110px 1fr; } }
+
+/* --- draggable cut boundaries --- */
+.cut-handle { position:absolute; top:28px; height:49px; width:13px; margin-left:-6px; padding:0; border:0; background:transparent; cursor:ew-resize; z-index:4; touch-action:none; }
+.cut-handle i { display:block; width:3px; height:100%; margin:0 auto; background:#e8dfd2; border-radius:2px; box-shadow:0 0 0 1px rgba(0,0,0,.35); opacity:.75; }
+.cut-handle:hover i, .cut-handle:focus-visible i { background:#ff9d84; opacity:1; }
+.cut-handle:focus-visible { outline:2px solid #ff9d84; outline-offset:1px; }
+.cut-handle.dragging i { background:#ff765b; opacity:1; width:4px; }

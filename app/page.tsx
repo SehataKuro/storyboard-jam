@@ -129,9 +129,13 @@ export default function Home() {
   const [peers, setPeers] = useState(0);
   const [busy, setBusy] = useState<{ label: string; ratio: number } | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  /** Live preview while a boundary is being dragged; committed on release. */
+  const [drag, setDrag] = useState<{ cutId: string; start: number } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const dragIndexRef = useRef(-1);
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
   const historyRef = useRef<Record<string, Stroke[][]>>({});
@@ -139,11 +143,16 @@ export default function Home() {
   const roomRef = useRef<Room | null>(null);
   const projectRef = useRef<Project>(project);
 
-  const cuts = project.cuts;
-  const totalDuration = project.duration;
+  // While dragging a boundary the UI shows the pending position, not the committed one.
+  const displayProject = useMemo(
+    () => (drag ? applyOp(project, { type: "move", cutId: drag.cutId, start: drag.start }) : project),
+    [project, drag],
+  );
+  const cuts = displayProject.cuts;
+  const totalDuration = displayProject.duration;
   const activeIndex = Math.max(0, cuts.findIndex((cut) => cut.id === activeId));
   const activeCut = cuts[activeIndex] || cuts[0];
-  const activeDuration = cutDurationOf(project, activeIndex);
+  const activeDuration = cutDurationOf(displayProject, activeIndex);
   const isLastCut = activeIndex === cuts.length - 1;
   const exportName = projectName.trim() || "storyboard";
 
@@ -503,6 +512,64 @@ export default function Home() {
     seek(((event.clientX - rect.left) / rect.width) * totalDuration);
   };
 
+  /** Where a boundary is allowed to land: never past its neighbours. */
+  const boundaryRange = useCallback((index: number) => {
+    const current = projectRef.current;
+    const lower = current.cuts[index - 1].start + MIN_CUT_DURATION;
+    const upper = (index + 1 < current.cuts.length ? current.cuts[index + 1].start : current.duration) - MIN_CUT_DURATION;
+    return { lower, upper };
+  }, []);
+
+  const timeAtClientX = (clientX: number) => {
+    const rect = timelineRef.current?.getBoundingClientRect();
+    if (!rect) return 0;
+    return ((clientX - rect.left) / rect.width) * totalDuration;
+  };
+
+  const beginBoundaryDrag = (event: ReactPointerEvent<HTMLButtonElement>, index: number) => {
+    event.stopPropagation();
+    event.preventDefault();
+    dragIndexRef.current = index;
+    setDrag({ cutId: cuts[index].id, start: cuts[index].start });
+  };
+
+  // Tracked on the window rather than via pointer capture, so the drag survives
+  // the pointer leaving the thin handle.
+  useEffect(() => {
+    if (!drag) return;
+    const onMove = (event: PointerEvent) => {
+      const { lower, upper } = boundaryRange(dragIndexRef.current);
+      if (upper < lower) return;
+      const start = Math.min(Math.max(timeAtClientX(event.clientX), lower), upper);
+      setDrag((current) => (current ? { ...current, start } : current));
+    };
+    const onUp = () => {
+      mutate({ type: "move", cutId: drag.cutId, start: drag.start });
+      setToast(`区切りを ${formatTime(drag.start)} に移動しました`);
+      setDrag(null);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [drag, boundaryRange, mutate, totalDuration]);
+
+  /** Keyboard equivalent of dragging, so boundaries are reachable without a pointer. */
+  const nudgeBoundary = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    event.stopPropagation();
+    const step = (event.shiftKey ? 1 : 1 / DEFAULT_FPS) * (event.key === "ArrowLeft" ? -1 : 1);
+    const { lower, upper } = boundaryRange(index);
+    if (upper < lower) return;
+    const cut = projectRef.current.cuts[index];
+    mutate({ type: "move", cutId: cut.id, start: Math.min(Math.max(cut.start + step, lower), upper) });
+  };
+
   const rulerMarks = useMemo(() => {
     const count = Math.min(21, 5 * Math.round(zoom));
     return Array.from({ length: count }, (_, index) => index / (count - 1));
@@ -539,7 +606,7 @@ export default function Home() {
                 <span className="thumb"><MiniCanvas strokes={cut.strokes} />{cut.strokes.length === 0 && <span className={`placeholder p${index % 4}`} />}</span>
                 <span className="cut-copy">
                   <strong className={cut.title.trim() ? "" : "untitled"}>{cutLabel(cut.title, index)}</strong>
-                  <small>{cutDurationOf(project, index).toFixed(1)}秒 · {formatTime(cut.start)}</small>
+                  <small>{cutDurationOf(displayProject, index).toFixed(1)}秒 · {formatTime(cut.start)}</small>
                 </span>
               </button>
             ))}
@@ -618,17 +685,31 @@ export default function Home() {
         <div className="timeline-scroller">
           <div className="track-labels"><span>VIDEO</span><span>AUDIO</span></div>
           <div className="timeline-viewport" ref={viewportRef}>
-            <div className="timeline" style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
+            <div className="timeline" ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
               <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatTime(v * totalDuration).slice(0, 5)}</span>)}</div>
               <div className="video-track">
                 {cuts.map((cut, index) => (
                   <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""}`}
-                    style={{ width: `${(cutDurationOf(project, index) / totalDuration) * 100}%` }}
+                    style={{ width: `${(cutDurationOf(displayProject, index) / totalDuration) * 100}%` }}
                     onClick={(e) => { e.stopPropagation(); chooseCut(index); }}>
                     <span>{index + 1}</span><b>{cut.title}</b>
                   </button>
                 ))}
               </div>
+              {cuts.slice(1).map((cut, offset) => {
+                const index = offset + 1;
+                return (
+                  <button key={`handle-${cut.id}`} className={`cut-handle ${drag?.cutId === cut.id ? "dragging" : ""}`}
+                    style={{ left: `${(cut.start / totalDuration) * 100}%` }}
+                    title={`${cutLabel(cut.title, index)} の開始位置 ${formatTime(cut.start)}`}
+                    aria-label={`カット${index + 1}の開始位置を調整`}
+                    onPointerDown={(e) => beginBoundaryDrag(e, index)}
+                    onKeyDown={(e) => nudgeBoundary(e, index)}
+                    onClick={(e) => e.stopPropagation()}>
+                    <i />
+                  </button>
+                );
+              })}
               <div className="audio-track"><div className="waveform">{Array.from({ length: 90 }, (_, i) => <i key={i} style={{ height: `${20 + ((i * 37) % 65)}%` }} />)}</div></div>
               <div className="playhead" style={{ left: `${(currentTime / totalDuration) * 100}%` }}><i /></div>
             </div>
