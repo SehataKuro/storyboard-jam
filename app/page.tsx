@@ -22,6 +22,7 @@ import {
   newCutId,
   normalizeProject,
   parseFrameDuration,
+  snapToFrame,
 } from "./lib/types";
 import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
@@ -199,6 +200,53 @@ function MiniCanvas({ strokes, backgroundImage }: { strokes: Stroke[]; backgroun
     if (ref.current) drawCanvas(ref.current, strokes, image, null, true);
   }, [strokes, image]);
   return <canvas ref={ref} className="mini-canvas" aria-hidden="true" />;
+}
+
+/**
+ * A text field that keeps its own value while focused.
+ *
+ * Two problems come from binding these straight to the shared project: an IME
+ * commits its pre-conversion text on every keystroke, and the snapshot that
+ * comes back from the room arrives late enough to resurrect characters the
+ * user has already deleted. Letting the field own its text and only adopting
+ * the incoming value while unfocused fixes both.
+ */
+function BufferedField({
+  value,
+  onCommit,
+  multiline,
+  ...rest
+}: {
+  value: string;
+  onCommit: (value: string) => void;
+  multiline?: boolean;
+} & Omit<React.InputHTMLAttributes<HTMLInputElement> & React.TextareaHTMLAttributes<HTMLTextAreaElement>, "value" | "onChange">) {
+  // The DOM element owns the text while it is being edited; React only pushes
+  // an incoming value in when the field is not the one being typed into.
+  const fieldRef = useRef<HTMLInputElement & HTMLTextAreaElement>(null);
+  const composing = useRef(false);
+  useEffect(() => {
+    const field = fieldRef.current;
+    if (!field || field === document.activeElement || field.value === value) return;
+    field.value = value;
+  }, [value]);
+
+  const handlers = {
+    ref: fieldRef,
+    defaultValue: value,
+    onChange: (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      // Mid-conversion IME text is not an edit yet; compositionend commits it.
+      if (!composing.current) onCommit(event.target.value);
+    },
+    onCompositionStart: () => { composing.current = true; },
+    onCompositionEnd: (event: React.CompositionEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      composing.current = false;
+      onCommit((event.target as HTMLInputElement | HTMLTextAreaElement).value);
+    },
+  };
+  return multiline
+    ? <textarea {...rest} {...handlers} />
+    : <input {...rest} {...handlers} />;
 }
 
 const ROLE_LABEL: Record<RoomRole, string> = {
@@ -456,7 +504,7 @@ export default function Home() {
   }, [currentTime, zoom, totalDuration]);
 
   const seek = useCallback((time: number) => {
-    const next = Math.max(0, Math.min(totalDuration, time));
+    const next = snapToFrame(Math.max(0, Math.min(totalDuration, time)));
     setCurrentTime(next);
     if (audioRef.current) audioRef.current.currentTime = Math.min(next, audioRef.current.duration || next);
     playStartRef.current = { at: performance.now(), time: next };
@@ -851,7 +899,7 @@ export default function Home() {
     const onMove = (event: PointerEvent) => {
       const { lower, upper } = boundaryRange(dragIndexRef.current);
       if (upper < lower) return;
-      const start = Math.min(Math.max(timeAtClientX(event.clientX), lower), upper);
+      const start = Math.min(Math.max(snapToFrame(timeAtClientX(event.clientX)), lower), upper);
       setDrag((current) => (current ? { ...current, start } : current));
     };
     const onUp = () => {
@@ -893,8 +941,8 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">C</span><span>CONTE</span><b>LIVE</b></div>
         <div className="project-title">
           <button className="crumb">Projects</button><span>/</span>
-          <input aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName}
-            onChange={(e) => renameProject(e.target.value)} disabled={role === "connecting"} />
+          <BufferedField aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName}
+            onCommit={renameProject} disabled={role === "connecting"} />
           <span className="saved"><i />{
             role === "host" ? "この端末に保存"
               : role === "guest" ? "同期＋バックアップ"
@@ -964,7 +1012,7 @@ export default function Home() {
             </div>
             {panelOpen && <aside className="note-panel">
               <div className="note-head"><span>カット情報</span><button onClick={() => setPanelOpen(false)}>×</button></div>
-              <label>カット名<input placeholder={cutLabel("", activeIndex)} value={activeCut.title} onChange={(e) => updateActive({ title: e.target.value })} /></label>
+              <label htmlFor="cut-title">カット名<BufferedField id="cut-title" key={`title-${activeId}`} placeholder={cutLabel("", activeIndex)} value={activeCut.title} onCommit={(title) => updateActive({ title })} /></label>
               <label>尺
                 <div className="duration-field">
                   <input type="text" inputMode="numeric" value={durationInput} disabled={isLastCut || role === "connecting"}
@@ -977,7 +1025,7 @@ export default function Home() {
                 </div>
               </label>
               {isLastCut && <p className="field-hint">最後のカットは楽曲の終わりまでです</p>}
-              <label>演出メモ<textarea value={activeCut.note} onChange={(e) => updateActive({ note: e.target.value })} /></label>
+              <label htmlFor="cut-note">演出メモ<BufferedField id="cut-note" multiline key={`note-${activeId}`} value={activeCut.note} onCommit={(note) => updateActive({ note })} /></label>
               <div className="tag-row"><span>CAM</span><button>FIX</button><button>PAN →</button><button>＋</button></div>
               <div className="note-actions"><button onClick={splitAtPlayhead}>分割</button><button onClick={() => void exportFrame()}>PNG</button><button className="danger" onClick={deleteCut}>削除</button></div>
             </aside>}
@@ -1020,8 +1068,11 @@ export default function Home() {
               <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatFramePosition(v * totalDuration)}</span>)}</div>
               <div className="video-track">
                 {cuts.map((cut, index) => (
-                  <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""}`}
-                    style={{ width: `${(cutDurationOf(displayProject, index) / totalDuration) * 100}%` }}
+                  <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""} ${index % 2 ? "odd" : ""}`}
+                    style={{
+                      left: `${(cut.start / totalDuration) * 100}%`,
+                      width: `${(cutDurationOf(displayProject, index) / totalDuration) * 100}%`,
+                    }}
                     onClick={(e) => { e.stopPropagation(); chooseCut(index); }}>
                     <span>{index + 1}</span><b>{cut.title}</b>
                   </button>

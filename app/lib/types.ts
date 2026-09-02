@@ -23,6 +23,12 @@ export const EXPORT_WIDTH = 1920;
 export const EXPORT_HEIGHT = 1080;
 export const DEFAULT_FPS = 24;
 
+/** The timeline's smallest unit is one frame, so every position lands on one. */
+export function snapToFrame(seconds: number, fps = DEFAULT_FPS) {
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.round(seconds * fps) / fps;
+}
+
 /** A timeline position is zero-based: frame 24 is displayed as 1+0. */
 export function formatFramePosition(seconds: number, fps = DEFAULT_FPS) {
   const totalFrames = Math.max(0, Math.round((Number.isFinite(seconds) ? seconds : 0) * fps));
