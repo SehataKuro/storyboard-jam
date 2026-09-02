@@ -200,6 +200,7 @@ export default function Home() {
   const redoRef = useRef<Record<string, Stroke[][]>>({});
   const roomRef = useRef<Room | null>(null);
   const projectRef = useRef<Project>(project);
+  const previousRoleRef = useRef<RoomRole>("connecting");
 
   // While dragging a boundary the UI shows the pending position, not the committed one.
   const displayProject = useMemo(
@@ -286,6 +287,17 @@ export default function Home() {
     room.connect();
     return () => { room.close(); roomRef.current = null; };
   }, []);
+
+  useEffect(() => {
+    const previousRole = previousRoleRef.current;
+    previousRoleRef.current = role;
+    if (previousRole !== "guest" || role !== "closed") return;
+
+    const shouldReload = window.confirm(
+      "ホストとの接続が切断されました。再読み込みして再接続しますか？",
+    );
+    if (shouldReload) window.location.reload();
+  }, [role]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
