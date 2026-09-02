@@ -1,7 +1,7 @@
 import { Stroke } from "./types";
 
 /** Stroke sizes are authored against a stage roughly this wide, so exports scale from it. */
-const STROKE_REFERENCE_WIDTH = 960;
+export const STROKE_REFERENCE_WIDTH = 960;
 export const PAPER_COLOR = "#fffef8";
 
 /** Paints one cut onto any 2D context. Used by the editor, the PNG sequence and the movie encoder. */

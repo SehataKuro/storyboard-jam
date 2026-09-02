@@ -5,6 +5,10 @@ import {
   DEFAULT_FPS,
   EXPORT_HEIGHT,
   EXPORT_WIDTH,
+  CANVAS_HEIGHT,
+  CANVAS_WIDTH,
+  MARGIN_RATIO_X,
+  MARGIN_RATIO_Y,
   MIN_CUT_DURATION,
   Point,
   Project,
@@ -19,7 +23,7 @@ import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
-import { paintStrokes } from "./lib/render";
+import { STROKE_REFERENCE_WIDTH, paintStrokes } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
 
@@ -43,9 +47,44 @@ function formatTime(seconds: number) {
   return `${min}:${sec}:${frame}`;
 }
 
+/**
+ * Stage geometry for a given canvas size. Thumbnails show the frame alone;
+ * the editor adds the working margin around it.
+ */
+function frameBox(width: number, height: number, withMargin: boolean) {
+  const left = withMargin ? width * MARGIN_RATIO_X : 0;
+  const top = withMargin ? height * MARGIN_RATIO_Y : 0;
+  return { left, top, width: width - left * 2, height: height - top * 2 };
+}
+
+const MAX_STAGE_WIDTH = 1120;
+
+/**
+ * Sizes the stage to fit its padded container while keeping the frame-plus-margin ratio.
+ * CSS aspect-ratio alone breaks here: max-height clamps the height without shrinking the width.
+ */
+function fitCanvas(canvas: HTMLCanvasElement) {
+  const wrap = canvas.parentElement;
+  if (!wrap) return;
+  const style = getComputedStyle(wrap);
+  const box = wrap.getBoundingClientRect();
+  const availableWidth = box.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const availableHeight = box.height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  const ratio = CANVAS_WIDTH / CANVAS_HEIGHT;
+  let width = Math.max(1, Math.min(availableWidth, MAX_STAGE_WIDTH));
+  let height = width / ratio;
+  if (height > availableHeight) {
+    height = Math.max(1, availableHeight);
+    width = height * ratio;
+  }
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+}
+
 function drawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], draft?: Stroke | null, thumbnail = false) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
+  if (!thumbnail) fitCanvas(canvas);
   const dpr = thumbnail ? 1 : Math.min(window.devicePixelRatio || 1, 2);
   const rect = canvas.getBoundingClientRect();
   const width = Math.max(1, rect.width);
@@ -59,37 +98,53 @@ function drawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], draft?: Stroke
   ctx.fillStyle = "#fffef8";
   ctx.fillRect(0, 0, width, height);
 
+  const frame = frameBox(width, height, !thumbnail);
+
   if (!thumbnail) {
     ctx.strokeStyle = "rgba(54, 49, 41, .10)";
     ctx.lineWidth = 1;
     ctx.setLineDash([5, 7]);
-    [1 / 3, 2 / 3].forEach((x) => {
-      ctx.beginPath(); ctx.moveTo(width * x, 0); ctx.lineTo(width * x, height); ctx.stroke();
-    });
-    [1 / 3, 2 / 3].forEach((y) => {
-      ctx.beginPath(); ctx.moveTo(0, height * y); ctx.lineTo(width, height * y); ctx.stroke();
+    [1 / 3, 2 / 3].forEach((ratio) => {
+      const x = frame.left + frame.width * ratio;
+      ctx.beginPath(); ctx.moveTo(x, frame.top); ctx.lineTo(x, frame.top + frame.height); ctx.stroke();
+      const y = frame.top + frame.height * ratio;
+      ctx.beginPath(); ctx.moveTo(frame.left, y); ctx.lineTo(frame.left + frame.width, y); ctx.stroke();
     });
     ctx.setLineDash([]);
-    ctx.strokeStyle = "rgba(54, 49, 41, .18)";
-    ctx.strokeRect(width * .08, height * .08, width * .84, height * .84);
   }
 
-  const scale = thumbnail ? .32 : 1;
+  // Stroke sizes are authored against the frame, so editor, thumbnail and export all match.
+  const strokeScale = frame.width / STROKE_REFERENCE_WIDTH;
   [...strokes, ...(draft ? [draft] : [])].forEach((stroke) => {
     if (stroke.points.length < 1) return;
     ctx.globalCompositeOperation = stroke.eraser ? "destination-out" : "source-over";
     ctx.strokeStyle = stroke.color;
-    ctx.lineWidth = stroke.size * scale;
+    ctx.lineWidth = Math.max(thumbnail ? .5 : 1, stroke.size * strokeScale);
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.beginPath();
     const first = stroke.points[0];
-    ctx.moveTo(first.x * width, first.y * height);
-    stroke.points.slice(1).forEach((p) => ctx.lineTo(p.x * width, p.y * height));
-    if (stroke.points.length === 1) ctx.lineTo(first.x * width + .1, first.y * height + .1);
+    ctx.moveTo(frame.left + first.x * frame.width, frame.top + first.y * frame.height);
+    stroke.points.slice(1).forEach((p) => ctx.lineTo(frame.left + p.x * frame.width, frame.top + p.y * frame.height));
+    if (stroke.points.length === 1) {
+      ctx.lineTo(frame.left + first.x * frame.width + .1, frame.top + first.y * frame.height + .1);
+    }
     ctx.stroke();
     ctx.globalCompositeOperation = "source-over";
   });
+
+  if (!thumbnail) {
+    // Everything outside the frame is drawable but will not be exported, so dim it.
+    ctx.fillStyle = "rgba(0, 0, 0, .5)";
+    ctx.fillRect(0, 0, width, frame.top);
+    ctx.fillRect(0, frame.top + frame.height, width, height - frame.top - frame.height);
+    ctx.fillRect(0, frame.top, frame.left, frame.height);
+    ctx.fillRect(frame.left + frame.width, frame.top, width - frame.left - frame.width, frame.height);
+
+    ctx.strokeStyle = "rgba(255, 255, 255, .55)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(frame.left + .5, frame.top + .5, frame.width - 1, frame.height - 1);
+  }
 }
 
 function MiniCanvas({ strokes }: { strokes: Stroke[] }) {
@@ -309,9 +364,14 @@ export default function Home() {
     }
   }, [playing, currentTime, totalDuration, audioUrl, seek]);
 
+  // Coordinates are normalised against the frame, so values outside 0..1 sit in the margin.
   const pointerPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
-    return { x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height };
+    const frame = frameBox(rect.width, rect.height, true);
+    return {
+      x: (event.clientX - rect.left - frame.left) / frame.width,
+      y: (event.clientY - rect.top - frame.top) / frame.height,
+    };
   };
 
   const beginStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {

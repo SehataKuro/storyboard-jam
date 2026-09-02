@@ -10,9 +10,18 @@ export type Cut = { id: string; title: string; note: string; start: number; stro
 /** The shared project: the song length owns the total, cuts partition it. */
 export type Project = { duration: number; cuts: Cut[] };
 
+/** The frame is what gets exported. Stroke coordinates are normalised against it. */
 export const EXPORT_WIDTH = 1920;
 export const EXPORT_HEIGHT = 1080;
 export const DEFAULT_FPS = 24;
+
+/** Working margin around the frame, in frame pixels. Drawable, but outside the export. */
+export const FRAME_MARGIN = 200;
+export const CANVAS_WIDTH = EXPORT_WIDTH + FRAME_MARGIN * 2;
+export const CANVAS_HEIGHT = EXPORT_HEIGHT + FRAME_MARGIN * 2;
+/** How much of the stage each margin band takes, used to place the frame on any canvas size. */
+export const MARGIN_RATIO_X = FRAME_MARGIN / CANVAS_WIDTH;
+export const MARGIN_RATIO_Y = FRAME_MARGIN / CANVAS_HEIGHT;
 
 /** Used until a song is loaded, so the timeline is never zero-length. */
 export const DEFAULT_DURATION = 60;
