@@ -9,7 +9,9 @@ export type RoomOp =
   | { type: "move"; cutId: string; start: number }
   | { type: "delete"; cutId: string }
   /** Host loaded a song, so the whole board adopts its length. */
-  | { type: "duration"; value: number };
+  | { type: "duration"; value: number }
+  /** A whole board was imported from an exported bundle. */
+  | { type: "replace"; project: Project };
 
 export type RoomRole = "connecting" | "host" | "guest" | "closed";
 
@@ -253,6 +255,10 @@ export function applyOp(project: Project, op: RoomOp): Project {
     if (upper < lower) return project;
     const start = Math.min(Math.max(op.start, lower), upper);
     return { ...project, cuts: project.cuts.map((cut, i) => (i === index ? { ...cut, start } : cut)) };
+  }
+
+  if (op.type === "replace") {
+    return normalizeProject(op.project);
   }
 
   if (op.type === "duration") {

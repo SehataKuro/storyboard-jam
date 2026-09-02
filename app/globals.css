@@ -139,3 +139,8 @@ button { cursor:pointer; }
 .cut-handle:hover i, .cut-handle:focus-visible i { background:#ff9d84; opacity:1; }
 .cut-handle:focus-visible { outline:2px solid #ff9d84; outline-offset:1px; }
 .cut-handle.dragging i { background:#ff765b; opacity:1; width:4px; }
+
+.import-action { border:1px solid var(--line); background:#fffefa; border-radius:7px; padding:8px 11px; font-size:11px; font-weight:700; color:#4a453d; cursor:pointer; white-space:nowrap; }
+.import-action:hover { background:#f2ede3; }
+.import-action input { display:none; }
+@media (max-width:900px) { .import-action { padding:7px 8px; font-size:10px; } }

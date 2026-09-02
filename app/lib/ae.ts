@@ -19,7 +19,7 @@ export function buildAeScript(project: Project, options: { fps: number; width: n
 
   return `// CONTE LIVE -> After Effects
 // After Effects で [ファイル > スクリプト > スクリプトファイルを実行] から実行してください。
-// 書き出した連番PNGの1枚目を選ぶと、コンポとタイムリマップのキーを自動生成します。
+// images フォルダ内の1枚目を選ぶと、コンポとタイムリマップのキーを自動生成します。
 (function () {
   var FPS = ${fps};
   var WIDTH = ${width};
@@ -30,7 +30,7 @@ export function buildAeScript(project: Project, options: { fps: number; width: n
 ${rows}
   ];
 
-  var first = File.openDialog("連番画像の1枚目（cut_0001.png）を選択してください");
+  var first = File.openDialog("images フォルダ内の1枚目（cut_0001.png）を選択してください");
   if (!first) { return; }
 
   app.beginUndoGroup("CONTE LIVE Import");
@@ -86,7 +86,7 @@ ${rows}
 export function buildCutSheet(project: Project, fps: number) {
   const lines = project.cuts.map((cut, index) => [
     String(index + 1).padStart(4, "0"),
-    `cut_${String(index + 1).padStart(4, "0")}.png`,
+    `images/cut_${String(index + 1).padStart(4, "0")}.png`,
     cutLabel(cut.title, index),
     `${cut.start.toFixed(3)}s`,
     `${cutDurationOf(project, index).toFixed(3)}s`,

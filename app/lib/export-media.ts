@@ -3,6 +3,7 @@ import { canvasToPngBlob, renderCutToCanvas } from "./render";
 import { buildAeScript, buildCutSheet, cutLabel } from "./ae";
 import { createZip, ZipEntry } from "./zip";
 import { Project, cutDurationOf, cutEndOf } from "./types";
+import { IMAGE_DIR, PROJECT_FILE, buildProjectFile } from "./project-io";
 
 export type ExportOptions = {
   fps: number;
@@ -13,6 +14,8 @@ export type ExportOptions = {
 };
 
 const paddedName = (index: number) => `cut_${String(index + 1).padStart(4, "0")}.png`;
+/** Images live in their own folder so the bundle root stays readable. */
+const imagePath = (index: number) => `${IMAGE_DIR}/${paddedName(index)}`;
 
 /** Frame index of a timeline position, used so per-cut frame counts never drift apart. */
 const frameAt = (seconds: number, fps: number) => Math.round(seconds * fps);
@@ -27,12 +30,14 @@ export async function exportSequenceZip(project: Project, options: ExportOptions
     onProgress?.(index / cuts.length, `カット ${index + 1}/${cuts.length} を描画中`);
     const canvas = renderCutToCanvas(cuts[index].strokes, width, height);
     const blob = await canvasToPngBlob(canvas);
-    entries.push({ name: paddedName(index), data: new Uint8Array(await blob.arrayBuffer()) });
+    entries.push({ name: imagePath(index), data: new Uint8Array(await blob.arrayBuffer()) });
   }
 
   const encoder = new TextEncoder();
   entries.push({ name: `${projectName}.jsx`, data: encoder.encode(buildAeScript(project, { fps, width, height, projectName })) });
   entries.push({ name: "cut_sheet.txt", data: encoder.encode(buildCutSheet(project, fps)) });
+  // Re-importable copy of the board, including the strokes the images cannot carry.
+  entries.push({ name: PROJECT_FILE, data: encoder.encode(buildProjectFile(project, projectName)) });
   entries.push({
     name: "timing.json",
     data: encoder.encode(JSON.stringify({
@@ -43,7 +48,7 @@ export async function exportSequenceZip(project: Project, options: ExportOptions
       totalDuration: project.duration,
       cuts: cuts.map((cut, index) => ({
         index: index + 1,
-        file: paddedName(index),
+        file: imagePath(index),
         title: cutLabel(cut.title, index),
         note: cut.note,
         start: cut.start,

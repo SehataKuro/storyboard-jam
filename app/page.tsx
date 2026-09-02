@@ -23,6 +23,7 @@ import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
+import { readBundleFromFiles, readBundleFromZip } from "./lib/project-io";
 import { STROKE_REFERENCE_WIDTH, paintStrokes } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
@@ -489,6 +490,28 @@ export default function Home() {
     setToast("現在のカットを書き出しました");
   };
 
+  /** Restores a board from an exported bundle: the ZIP itself or its extracted folder. */
+  const importBundle = async (event: ChangeEvent<HTMLInputElement>, from: "zip" | "folder") => {
+    const files = event.target.files;
+    if (!files?.length) return;
+    try {
+      const bundle = from === "zip" ? await readBundleFromZip(files[0]) : await readBundleFromFiles(files);
+      mutate({ type: "replace", project: bundle.project });
+      if (bundle.projectName) setProjectName(bundle.projectName);
+      setActiveId(bundle.project.cuts[0].id);
+      historyRef.current = {};
+      redoRef.current = {};
+      seek(0);
+      setToast(bundle.strokesRestored
+        ? `${bundle.project.cuts.length}カットを読み込みました`
+        : `カット割りのみ読み込みました（絵は含まれていません）`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "読み込みに失敗しました");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
   const runExport = async (label: string, task: () => Promise<void>) => {
     if (busy) return;
     setBusy({ label, ratio: 0 });
@@ -646,6 +669,13 @@ export default function Home() {
         </div>
         <div className="export-actions">
           <button onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
+          <label className="import-action" title="書き出したZIPを読み込む">
+            ZIP読込<input type="file" accept=".zip,application/zip" onChange={(e) => importBundle(e, "zip")} />
+          </label>
+          <label className="import-action" title="解凍したフォルダを読み込む">
+            フォルダ読込
+            <input type="file" onChange={(e) => importBundle(e, "folder")} {...{ webkitdirectory: "", directory: "" }} />
+          </label>
           <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
           <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
         </div>
