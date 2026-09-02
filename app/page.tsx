@@ -1,10 +1,11 @@
 "use client";
 
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-
-type Point = { x: number; y: number };
-type Stroke = { color: string; size: number; points: Point[]; eraser?: boolean };
-type Cut = { id: string; title: string; duration: number; note: string; strokes: Stroke[] };
+import { Cut, DEFAULT_FPS, EXPORT_HEIGHT, EXPORT_WIDTH, Point, Stroke, cutStartOf, totalDurationOf } from "./lib/types";
+import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
+import { exportMovie, exportSequenceZip } from "./lib/export-media";
+import { downloadBlob } from "./lib/zip";
+import { paintStrokes } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
 const INITIAL_CUTS: Cut[] = [
@@ -20,7 +21,7 @@ function formatTime(seconds: number) {
   const safe = Math.max(0, seconds || 0);
   const min = Math.floor(safe / 60);
   const sec = Math.floor(safe % 60).toString().padStart(2, "0");
-  const frame = Math.floor((safe % 1) * 24).toString().padStart(2, "0");
+  const frame = Math.floor((safe % 1) * DEFAULT_FPS).toString().padStart(2, "0");
   return `${min}:${sec}:${frame}`;
 }
 
@@ -55,12 +56,12 @@ function drawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], draft?: Stroke
     ctx.strokeRect(width * .08, height * .08, width * .84, height * .84);
   }
 
+  const scale = thumbnail ? .32 : 1;
   [...strokes, ...(draft ? [draft] : [])].forEach((stroke) => {
     if (stroke.points.length < 1) return;
     ctx.globalCompositeOperation = stroke.eraser ? "destination-out" : "source-over";
     ctx.strokeStyle = stroke.color;
-    ctx.fillStyle = stroke.color;
-    ctx.lineWidth = stroke.size * (thumbnail ? .32 : 1);
+    ctx.lineWidth = stroke.size * scale;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.beginPath();
@@ -81,6 +82,13 @@ function MiniCanvas({ strokes }: { strokes: Stroke[] }) {
   return <canvas ref={ref} className="mini-canvas" aria-hidden="true" />;
 }
 
+const ROLE_LABEL: Record<RoomRole, string> = {
+  connecting: "接続中…",
+  host: "ホスト（このタブが原本）",
+  guest: "ゲスト参加中",
+  closed: "切断（ローカル編集のみ）",
+};
+
 export default function Home() {
   const [cuts, setCuts] = useState<Cut[]>(INITIAL_CUTS);
   const [activeId, setActiveId] = useState("c1");
@@ -91,10 +99,15 @@ export default function Home() {
   const [playing, setPlaying] = useState(false);
   const [audioName, setAudioName] = useState("デモトラック");
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [audioFile, setAudioFile] = useState<File | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
-  const [toast, setToast] = useState("全員の変更を同期しました");
+  const [toast, setToast] = useState("ようこそ。ルームを開きました");
   const [draft, setDraft] = useState<Stroke | null>(null);
   const [collabPulse, setCollabPulse] = useState(false);
+  const [projectName, setProjectName] = useState("雨上がりのMV");
+  const [role, setRole] = useState<RoomRole>("connecting");
+  const [peers, setPeers] = useState(0);
+  const [busy, setBusy] = useState<{ label: string; ratio: number } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -102,90 +115,88 @@ export default function Home() {
   const playStartRef = useRef({ at: 0, time: 0 });
   const historyRef = useRef<Record<string, Stroke[][]>>({});
   const redoRef = useRef<Record<string, Stroke[][]>>({});
-  const clientId = useRef(Math.random().toString(36).slice(2));
-  const remoteChange = useRef(false);
-  const serverVersion = useRef(0);
-  const cloudReady = useRef(false);
-  const saving = useRef(false);
+  const roomRef = useRef<Room | null>(null);
+  const cutsRef = useRef<Cut[]>(INITIAL_CUTS);
+  const isHostRef = useRef(false);
 
-  const totalDuration = useMemo(() => cuts.reduce((sum, cut) => sum + cut.duration, 0), [cuts]);
+  const totalDuration = useMemo(() => totalDurationOf(cuts), [cuts]);
   const activeIndex = Math.max(0, cuts.findIndex((cut) => cut.id === activeId));
   const activeCut = cuts[activeIndex] || cuts[0];
-  const cutStart = useCallback((index: number) => cuts.slice(0, index).reduce((sum, cut) => sum + cut.duration, 0), [cuts]);
+  const cutStart = useCallback((index: number) => cutStartOf(cuts, index), [cuts]);
+
+  useEffect(() => { cutsRef.current = cuts; }, [cuts]);
+  useEffect(() => { isHostRef.current = role === "host"; }, [role]);
+
+  /** Local edits go through here: the host owns state, guests only propose. */
+  const mutate = useCallback((op: RoomOp) => {
+    const next = applyOp(cutsRef.current, op);
+    cutsRef.current = next;
+    setCuts(next);
+    const room = roomRef.current;
+    if (!room) return;
+    if (room.isHost()) room.broadcastSnapshot(next);
+    else room.sendOp(op);
+  }, []);
 
   useEffect(() => {
-    const stored = window.localStorage.getItem("conte-live-project") || window.localStorage.getItem("konte-live-project");
+    const stored = window.localStorage.getItem("conte-live-project");
     if (stored) {
       try {
-        const parsed = JSON.parse(stored) as { cuts: Cut[] };
-        if (parsed.cuts?.length) setCuts(parsed.cuts);
+        const parsed = JSON.parse(stored) as { cuts: Cut[]; projectName?: string };
+        if (parsed.cuts?.length) {
+          cutsRef.current = parsed.cuts;
+          setCuts(parsed.cuts);
+          setActiveId(parsed.cuts[0].id);
+        }
+        if (parsed.projectName) setProjectName(parsed.projectName);
       } catch { /* keep demo project */ }
     }
   }, []);
 
+  // Only the host persists: it is the copy everyone else is mirroring.
   useEffect(() => {
-    window.localStorage.setItem("conte-live-project", JSON.stringify({ cuts }));
-  }, [cuts]);
+    if (role !== "host") return;
+    window.localStorage.setItem("conte-live-project", JSON.stringify({ cuts, projectName }));
+  }, [cuts, projectName, role]);
 
   useEffect(() => {
-    let cancelled = false;
-    const pull = async (initial = false) => {
-      try {
-        const response = await fetch("/api/project?room=main", { cache: "no-store" });
-        const data = await response.json() as { project: { cuts: Cut[]; version: number } | null };
-        if (cancelled) return;
-        if (data.project && data.project.version > serverVersion.current) {
-          serverVersion.current = data.project.version;
-          remoteChange.current = true;
-          setCuts(data.project.cuts);
-          if (!initial) { setCollabPulse(true); window.setTimeout(() => setCollabPulse(false), 900); }
-        }
-        cloudReady.current = true;
-      } catch { cloudReady.current = true; }
+    const url = new URL(window.location.href);
+    let roomId = url.searchParams.get("room");
+    if (!roomId) {
+      // A fresh visit opens its own room so boards are not shared by guessing the URL.
+      roomId = Math.random().toString(36).slice(2, 10);
+      url.searchParams.set("room", roomId);
+      window.history.replaceState(null, "", url.toString());
+    }
+
+    const pulse = () => {
+      setCollabPulse(true);
+      window.setTimeout(() => setCollabPulse(false), 900);
     };
-    void pull(true);
-    const timer = window.setInterval(() => { if (!saving.current) void pull(); }, 1200);
-    return () => { cancelled = true; window.clearInterval(timer); };
+
+    const room = new Room(roomId, {
+      onRole: setRole,
+      onStatus: setToast,
+      onPeers: setPeers,
+      onSnapshot: (incoming) => {
+        cutsRef.current = incoming;
+        setCuts(incoming);
+        setActiveId((current) => (incoming.some((cut) => cut.id === current) ? current : incoming[0]?.id || current));
+        pulse();
+      },
+      onOp: (op) => {
+        const next = applyOp(cutsRef.current, op);
+        cutsRef.current = next;
+        setCuts(next);
+        roomRef.current?.broadcastSnapshot(next);
+        pulse();
+      },
+      getSnapshot: () => cutsRef.current,
+    });
+    roomRef.current = room;
+    room.connect();
+    return () => { room.close(); roomRef.current = null; };
   }, []);
-
-  useEffect(() => {
-    if (!cloudReady.current || remoteChange.current) return;
-    const timer = window.setTimeout(async () => {
-      saving.current = true;
-      try {
-        const response = await fetch("/api/project", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ room: "main", cuts }),
-        });
-        const data = await response.json() as { version?: number };
-        if (data.version) serverVersion.current = data.version;
-      } finally { saving.current = false; }
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [cuts]);
-
-  useEffect(() => {
-    const channel = new BroadcastChannel("conte-live-room-main");
-    channel.onmessage = (event) => {
-      if (event.data?.clientId === clientId.current) return;
-      if (event.data?.type === "project" && event.data.cuts) {
-        remoteChange.current = true;
-        setCuts(event.data.cuts);
-        setCollabPulse(true);
-        window.setTimeout(() => setCollabPulse(false), 900);
-      }
-      if (event.data?.type === "hello") channel.postMessage({ type: "project", cuts, clientId: clientId.current });
-    };
-    channel.postMessage({ type: "hello", clientId: clientId.current });
-    return () => channel.close();
-  }, []); // initial room connection
-
-  useEffect(() => {
-    if (remoteChange.current) { remoteChange.current = false; return; }
-    const channel = new BroadcastChannel("conte-live-room-main");
-    channel.postMessage({ type: "project", cuts, clientId: clientId.current });
-    channel.close();
-  }, [cuts]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -201,6 +212,7 @@ export default function Home() {
     return () => window.removeEventListener("resize", onResize);
   }, [activeCut, draft]);
 
+  // Playback position is intentionally local: every participant scrubs independently.
   useEffect(() => {
     let elapsed = 0;
     let found = cuts[0]?.id;
@@ -276,7 +288,7 @@ export default function Home() {
     if (!draft) return;
     historyRef.current[activeId] = [...(historyRef.current[activeId] || []), activeCut.strokes];
     redoRef.current[activeId] = [];
-    setCuts((all) => all.map((cut) => cut.id === activeId ? { ...cut, strokes: [...cut.strokes, draft] } : cut));
+    mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] });
     setDraft(null);
   };
 
@@ -286,7 +298,7 @@ export default function Home() {
     const previous = history[history.length - 1];
     redoRef.current[activeId] = [...(redoRef.current[activeId] || []), activeCut.strokes];
     historyRef.current[activeId] = history.slice(0, -1);
-    setCuts((all) => all.map((cut) => cut.id === activeId ? { ...cut, strokes: previous } : cut));
+    mutate({ type: "strokes", cutId: activeId, strokes: previous });
   };
 
   const redo = () => {
@@ -295,34 +307,34 @@ export default function Home() {
     const next = redoStack[redoStack.length - 1];
     historyRef.current[activeId] = [...(historyRef.current[activeId] || []), activeCut.strokes];
     redoRef.current[activeId] = redoStack.slice(0, -1);
-    setCuts((all) => all.map((cut) => cut.id === activeId ? { ...cut, strokes: next } : cut));
+    mutate({ type: "strokes", cutId: activeId, strokes: next });
   };
 
   const addCut = () => {
-    const id = `c${Date.now()}`;
-    const newCut: Cut = { id, title: `新しいカット ${cuts.length + 1}`, duration: 3, note: "演出メモを入力…", strokes: [] };
-    setCuts((all) => [...all, newCut]);
+    const id = `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+    mutate({ type: "add", cut: { id, title: `新しいカット ${cuts.length + 1}`, duration: 3, note: "演出メモを入力…", strokes: [] }, afterId: null });
     setActiveId(id);
     setCurrentTime(totalDuration);
     setToast("カットを追加しました");
   };
 
   const duplicateCut = () => {
-    const id = `c${Date.now()}`;
+    const id = `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     const clone = { ...activeCut, id, title: `${activeCut.title} コピー`, strokes: activeCut.strokes.map((s) => ({ ...s, points: [...s.points] })) };
-    setCuts((all) => [...all.slice(0, activeIndex + 1), clone, ...all.slice(activeIndex + 1)]);
+    mutate({ type: "add", cut: clone, afterId: activeCut.id });
     setToast("カットを複製しました");
   };
 
   const deleteCut = () => {
     if (cuts.length <= 1) return;
     const next = cuts.filter((cut) => cut.id !== activeId);
-    setCuts(next);
+    mutate({ type: "delete", cutId: activeId });
     setActiveId(next[Math.min(activeIndex, next.length - 1)].id);
     setToast("カットを削除しました");
   };
 
-  const updateActive = (patch: Partial<Cut>) => setCuts((all) => all.map((cut) => cut.id === activeId ? { ...cut, ...patch } : cut));
+  const updateActive = (patch: Partial<Pick<Cut, "title" | "duration" | "note">>) =>
+    mutate({ type: "patch", cutId: activeId, patch });
 
   const chooseCut = (cut: Cut, index: number) => {
     setActiveId(cut.id);
@@ -333,8 +345,8 @@ export default function Home() {
     const file = event.target.files?.[0];
     if (!file) return;
     if (audioUrl) URL.revokeObjectURL(audioUrl);
-    const url = URL.createObjectURL(file);
-    setAudioUrl(url);
+    setAudioUrl(URL.createObjectURL(file));
+    setAudioFile(file);
     setAudioName(file.name.replace(/\.[^.]+$/, ""));
     setPlaying(false);
     seek(0);
@@ -342,14 +354,58 @@ export default function Home() {
   };
 
   const exportFrame = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = EXPORT_WIDTH;
+    canvas.height = EXPORT_HEIGHT;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    paintStrokes(ctx, activeCut.strokes, EXPORT_WIDTH, EXPORT_HEIGHT);
     const link = document.createElement("a");
     link.download = `${activeCut.title}.png`;
     link.href = canvas.toDataURL("image/png");
     link.click();
     setToast("現在のカットを書き出しました");
   };
+
+  const runExport = async (label: string, task: () => Promise<void>) => {
+    if (busy) return;
+    setBusy({ label, ratio: 0 });
+    try {
+      await task();
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "書き出しに失敗しました");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const exportSequence = () => runExport("連番書き出し", async () => {
+    const blob = await exportSequenceZip(cuts, {
+      fps: DEFAULT_FPS,
+      width: EXPORT_WIDTH,
+      height: EXPORT_HEIGHT,
+      projectName,
+      onProgress: (ratio, label) => setBusy({ ratio, label }),
+    });
+    downloadBlob(blob, `${projectName}_sequence.zip`);
+    setToast("連番PNGとAEスクリプトを書き出しました");
+  });
+
+  const exportMp4 = () => runExport("ムービー書き出し", async () => {
+    const result = await exportMovie(cuts, audioFile, {
+      fps: DEFAULT_FPS,
+      width: EXPORT_WIDTH,
+      height: EXPORT_HEIGHT,
+      projectName,
+      onProgress: (ratio, label) => setBusy({ ratio, label }),
+    });
+    downloadBlob(result.blob, `${projectName}.mp4`);
+    if (result.hadAudio && !result.audioCodec) setToast("音声コーデック非対応のため映像のみ書き出しました");
+    else if (!result.hadAudio) setToast("音源未読み込みのため映像のみ書き出しました");
+    // Opus inside MP4 plays in browsers but After Effects will not read it.
+    else if (result.audioCodec === "opus") setToast("AAC非対応環境のため音声はOpusです（AEでは読めません）");
+    else setToast("音声付きMP4を書き出しました");
+  });
 
   const onTimelinePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -362,12 +418,16 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">C</span><span>CONTE</span><b>LIVE</b></div>
         <div className="project-title">
           <button className="crumb">Projects</button><span>/</span>
-          <input aria-label="プロジェクト名" defaultValue="雨上がりのMV" />
-          <span className="saved"><i />保存済み</span>
+          <input aria-label="プロジェクト名" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
+          <span className="saved"><i />{role === "host" ? "この端末に保存" : "ホストが保存中"}</span>
+        </div>
+        <div className="export-actions">
+          <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
+          <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
         </div>
         <div className="people" aria-label="参加中のメンバー">
-          <span className="presence-text"><i className={collabPulse ? "pulse" : ""} />共有ルーム接続中</span>
-          <div className="avatars"><span className="av av1">YOU</span></div>
+          <span className="presence-text" title={ROLE_LABEL[role]}><i className={collabPulse ? "pulse" : ""} />{ROLE_LABEL[role]}</span>
+          <div className="avatars"><span className="av av1">YOU</span>{peers > 0 && <span className="av av2">+{peers}</span>}</div>
           <button className="share" onClick={() => { navigator.clipboard?.writeText(location.href); setToast("招待リンクをコピーしました"); }}>招待する</button>
         </div>
       </header>
@@ -429,8 +489,10 @@ export default function Home() {
             <span className="timecode">{formatTime(currentTime)} <small>/ {formatTime(totalDuration)}</small></span>
           </div>
           <div className="audio-info">
-            <span className="wave-icon">≋</span><div><strong>{audioName}</strong><small>{audioUrl ? "読み込み済み" : "デモ再生 · 音源を追加できます"}</small></div>
+            <span className="wave-icon">≋</span><div><strong>{audioName}</strong><small>{audioUrl ? "読み込み済み · この端末だけで再生" : "デモ再生 · 音源を追加できます"}</small></div>
             <label className="audio-upload">音源を変更<input type="file" accept="audio/*" onChange={onAudio} /></label>
+            {/* Playback engine for the timeline, not user-facing media, so there is nothing to caption. */}
+            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             {audioUrl && <audio ref={audioRef} src={audioUrl} onEnded={() => setPlaying(false)} />}
           </div>
           <div className="view-control"><span>−</span><input type="range" min="70" max="130" defaultValue="100" /><span>＋</span></div>
@@ -447,6 +509,16 @@ export default function Home() {
           </div>
         </div>
       </section>
+
+      {busy && (
+        <div className="export-overlay" role="status">
+          <div className="export-card">
+            <strong>{busy.label}</strong>
+            <div className="export-bar"><i style={{ width: `${Math.round(busy.ratio * 100)}%` }} /></div>
+            <small>{Math.round(busy.ratio * 100)}%</small>
+          </div>
+        </div>
+      )}
       <div className="toast" key={toast}>{toast}</div>
     </main>
   );
