@@ -1,5 +1,4 @@
-# Storyboard Jam / CONTE LIVE
-
+# Storyboard Jam
 音楽に合わせてカットを切り替えながら、複数人で絵コンテを作るWebアプリです。
 
 ## 主な機能
