@@ -1,12 +1,14 @@
-import { MIN_CUT_DURATION, Project, Stroke, newCutId, normalizeProject } from "./types";
+import { Cut, MIN_CUT_DURATION, Project, Stroke, newCutId, normalizeProject } from "./types";
 
 export type RoomOp =
   | { type: "strokes"; cutId: string; strokes: Stroke[] }
   | { type: "content"; cutId: string; strokes: Stroke[]; backgroundImage?: string }
   | { type: "patch"; cutId: string; patch: { title?: string; note?: string } }
   | { type: "rename"; value: string }
+  /** Swap what two cuts show, leaving both timings untouched. */
+  | { type: "swap"; aId: string; bId: string }
   /** Insert a cut boundary at a point on the song timeline. */
-  | { type: "split"; at: number; id: string }
+  | { type: "split"; at: number; id: string; content?: Partial<Pick<Cut, "title" | "note" | "strokes" | "backgroundImage">> }
   /** Move an existing boundary, which resizes the cut before it. */
   | { type: "move"; cutId: string; start: number }
   | { type: "delete"; cutId: string }
@@ -245,6 +247,21 @@ export function applyOp(project: Project, op: RoomOp): Project {
     };
   }
 
+  if (op.type === "swap") {
+    const a = project.cuts.find((cut) => cut.id === op.aId);
+    const b = project.cuts.find((cut) => cut.id === op.bId);
+    if (!a || !b || a === b) return project;
+    return {
+      ...project,
+      cuts: project.cuts.map((cut) => {
+        // Only the drawing moves: each cut keeps its own place on the song.
+        if (cut.id === op.aId) return { ...cut, strokes: b.strokes, backgroundImage: b.backgroundImage };
+        if (cut.id === op.bId) return { ...cut, strokes: a.strokes, backgroundImage: a.backgroundImage };
+        return cut;
+      }),
+    };
+  }
+
   if (op.type === "patch") {
     return { ...project, cuts: project.cuts.map((cut) => (cut.id === op.cutId ? { ...cut, ...op.patch } : cut)) };
   }
@@ -263,8 +280,9 @@ export function applyOp(project: Project, op: RoomOp): Project {
     const at = op.at;
     if (at < MIN_CUT_DURATION || at > project.duration - MIN_CUT_DURATION) return project;
     if (project.cuts.some((cut) => Math.abs(cut.start - at) < MIN_CUT_DURATION)) return project;
-    // The new cut is a fresh blank frame starting at the split point.
-    const cut = { id: op.id || newCutId(), title: "", note: "", start: at, strokes: [] };
+    // The new cut starts blank at the split point unless the caller supplied
+    // content, which is how duplicating a cut works.
+    const cut: Cut = { id: op.id || newCutId(), title: "", note: "", start: at, strokes: [], ...op.content };
     return normalizeProject({ ...project, cuts: [...project.cuts, cut] });
   }
 

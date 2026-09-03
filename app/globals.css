@@ -79,7 +79,7 @@ button { cursor:pointer; }
 .note-panel textarea { height:82px; resize:vertical; line-height:1.6; }
 .duration-field { position:relative; }.duration-field span { position:absolute; right:9px; top:15px; font-size:9px; }.duration-field input { padding-right:48px; font-family:var(--font-geist-mono),monospace; }
 .tag-row { display:flex; align-items:center; gap:5px; margin:16px 0; }.tag-row span { font-size:8px; color:#898277; margin-right:4px; }.tag-row button { border:1px solid #d7d0c4; background:#fffefa; border-radius:4px; padding:5px 7px; font-size:8px; }
-.note-actions { display:flex; gap:5px; padding-top:12px; border-top:1px solid var(--line); }.note-actions button { flex:1; padding:7px 2px; border:1px solid #d7d0c4; background:#fffefa; border-radius:5px; font-size:9px; }.note-actions .danger { color:#bd4f3c; }
+.note-actions { display:flex; flex-wrap:wrap; gap:5px; padding-top:12px; border-top:1px solid var(--line); }.note-actions button { flex:1 1 30%; }.note-actions button { flex:1; padding:7px 2px; border:1px solid #d7d0c4; background:#fffefa; border-radius:5px; font-size:9px; }.note-actions .danger { color:#bd4f3c; }
 
 .transport { background:#24231f; color:#eae5dc; min-width:0; display:grid; grid-template-rows:52px minmax(0,1fr); }
 .transport-main { display:grid; grid-template-columns:330px minmax(300px,1fr) 150px; align-items:center; border-bottom:1px solid #48453f; padding:0 15px; }
@@ -122,6 +122,11 @@ button { cursor:pointer; }
 .stage-view-control button { border:0; background:rgba(255,255,255,.12); color:inherit; border-radius:4px; padding:3px 6px; font-size:10px; line-height:1; }
 .stage-view-control button:hover { background:rgba(255,255,255,.26); }
 .stage-view-control b { min-width:34px; text-align:center; font-variant-numeric:tabular-nums; }
+
+/* --- dragging a cut card onto another swaps their drawings --- */
+.cut-card { cursor:grab; }
+.cut-card.dragging { opacity:.45; cursor:grabbing; }
+.cut-list.swapping .cut-card:not(.dragging):hover { border-color:var(--accent); background:#fdf1ec; }
 .timeline-viewport .timeline { min-width:100%; margin:0 0 10px; }
 .view-control { display:flex; align-items:center; gap:5px; color:#9a958d; font-size:11px; }
 .view-control button { border:1px solid #5c5851; background:transparent; color:#cfcac1; border-radius:4px; width:20px; height:20px; line-height:1; padding:0; }

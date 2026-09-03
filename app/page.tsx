@@ -16,6 +16,7 @@ import {
   Cut,
   createEmptyProject,
   cutDurationOf,
+  cutEndOf,
   cutIndexAt,
   formatFrameDuration,
   formatFramePosition,
@@ -44,6 +45,8 @@ const SHORTCUTS: [string, string][] = [
   [", / .", "前 / 次のカットへ"],
   ["Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直す"],
   ["Ctrl+V", "画像を現在のカットへ貼り付け"],
+  ["Ctrl+C / Ctrl+Shift+V", "カットの絵をコピー / 貼り付け"],
+  ["Ctrl+D", "カットを複製"],
   ["Delete", "選択中のカットを削除"],
   ["?", "このヘルプ"],
 ];
@@ -299,6 +302,8 @@ export default function Home() {
   const [stageDrag, setStageDrag] = useState<"pan" | "rotate" | null>(null);
   /** Laid-out width of the stage, used to size the brush ring. */
   const [canvasWidth, setCanvasWidth] = useState(0);
+  /** Index of the cut card being dragged onto another to swap the drawings. */
+  const [dragCutId, setDragCutId] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -308,6 +313,8 @@ export default function Home() {
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
   const historyRef = useRef<Record<string, CutContent[]>>({});
+  /** Cut content copied with Ctrl+C, pasted into another cut with Ctrl+Shift+V. */
+  const cutClipboardRef = useRef<CutContent | null>(null);
   const redoRef = useRef<Record<string, CutContent[]>>({});
   const roomRef = useRef<Room | null>(null);
   const roomIdRef = useRef<string | null>(null);
@@ -763,6 +770,65 @@ export default function Home() {
     }
   }, [activeId, activeIndex, mutate]);
 
+  /** Records the current content so the next content change can be undone. */
+  const rememberContent = (cut: Cut) => {
+    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
+    redoRef.current[cut.id] = [];
+  };
+
+  /** Swaps two drawings without touching either cut's place on the song. */
+  const swapCutContent = useCallback((aId: string, bId: string) => {
+    const current = projectRef.current;
+    const a = current.cuts.find((cut) => cut.id === aId);
+    const b = current.cuts.find((cut) => cut.id === bId);
+    if (!a || !b || a === b) return;
+    if (mutate({ type: "swap", aId, bId })) {
+      rememberContent(a);
+      rememberContent(b);
+      setToast("カットの絵を入れ替えました");
+    }
+  }, [mutate]);
+
+  const copyCutContent = useCallback(() => {
+    const cut = projectRef.current.cuts.find((item) => item.id === activeId);
+    if (!cut) return;
+    cutClipboardRef.current = cutContent(cut);
+    setToast("カットの絵をコピーしました");
+  }, [activeId]);
+
+  const pasteCutContent = useCallback(() => {
+    const copied = cutClipboardRef.current;
+    const cut = projectRef.current.cuts.find((item) => item.id === activeId);
+    if (!copied || !cut) {
+      setToast("コピーされたカットがありません");
+      return;
+    }
+    if (mutate({ type: "content", cutId: cut.id, ...copied })) {
+      rememberContent(cut);
+      setToast("カットの絵を貼り付けました");
+    }
+  }, [activeId, mutate]);
+
+  /** Duplicating splits the cut in half and fills the second half with a copy. */
+  const duplicateCut = useCallback(() => {
+    const current = projectRef.current;
+    const index = current.cuts.findIndex((cut) => cut.id === activeId);
+    const cut = current.cuts[index];
+    if (!cut) return;
+    const end = cutEndOf(current, index);
+    const at = snapToFrame(cut.start + (end - cut.start) / 2);
+    if (at - cut.start < MIN_CUT_DURATION || end - at < MIN_CUT_DURATION) {
+      setToast("このカットは短すぎて複製できません");
+      return;
+    }
+    const id = newCutId();
+    if (mutate({ type: "split", at, id, content: { ...cutContent(cut), title: cut.title, note: cut.note } })) {
+      setActiveId(id);
+      seek(at);
+      setToast("カットを複製しました");
+    }
+  }, [activeId, mutate, seek]);
+
   const updateActive = (patch: { title?: string; note?: string }) =>
     mutate({ type: "patch", cutId: activeId, patch });
 
@@ -917,6 +983,21 @@ export default function Home() {
         if (event.shiftKey) redo(); else undo();
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "c") {
+        event.preventDefault();
+        copyCutContent();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && key.toLowerCase() === "v") {
+        event.preventDefault();
+        pasteCutContent();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "d") {
+        event.preventDefault();
+        duplicateCut();
+        return;
+      }
       if (event.ctrlKey || event.metaKey || event.altKey) return;
 
       switch (key) {
@@ -938,7 +1019,8 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [busy, currentTime, activeIndex, togglePlay, splitAtPlayhead, deleteCut, chooseCut, seek, undo, redo]);
+  }, [busy, currentTime, activeIndex, togglePlay, splitAtPlayhead, deleteCut, chooseCut, seek, undo, redo,
+    copyCutContent, pasteCutContent, duplicateCut]);
 
   const onTimelinePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -1141,9 +1223,21 @@ export default function Home() {
       <section className="workspace">
         <aside className="cuts-panel">
           <div className="section-heading"><span>カット</span><button onClick={splitAtPlayhead} title="再生位置で分割 (S)" aria-label="再生位置で分割">✂</button></div>
-          <div className="cut-list">
+          <div className={`cut-list ${dragCutId ? "swapping" : ""}`}>
             {cuts.map((cut, index) => (
-              <button key={cut.id} className={`cut-card ${cut.id === activeId ? "active" : ""}`} onClick={() => chooseCut(index)}>
+              <button key={cut.id}
+                className={`cut-card ${cut.id === activeId ? "active" : ""} ${dragCutId === cut.id ? "dragging" : ""}`}
+                onClick={() => chooseCut(index)}
+                draggable
+                onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", cut.id); setDragCutId(cut.id); }}
+                onDragEnd={() => setDragCutId(null)}
+                onDragOver={(e) => { if (dragCutId && dragCutId !== cut.id) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const source = e.dataTransfer.getData("text/plain") || dragCutId;
+                  setDragCutId(null);
+                  if (source && source !== cut.id) swapCutContent(source, cut.id);
+                }}>
                 <span className="cut-no">{String(index + 1).padStart(2, "0")}</span>
                 <span className="thumb"><MiniCanvas strokes={cut.strokes} backgroundImage={cut.backgroundImage} />{cut.strokes.length === 0 && !cut.backgroundImage && <span className={`placeholder p${index % 4}`} />}</span>
                 <span className="cut-copy">
@@ -1211,7 +1305,14 @@ export default function Home() {
               {isLastCut && <p className="field-hint">最後のカットは楽曲の終わりまでです</p>}
               <label htmlFor="cut-note">演出メモ<BufferedField id="cut-note" multiline key={`note-${activeId}`} value={activeCut.note} onCommit={(note) => updateActive({ note })} /></label>
               <div className="tag-row"><span>CAM</span><button>FIX</button><button>PAN →</button><button>＋</button></div>
-              <div className="note-actions"><button onClick={splitAtPlayhead}>分割</button><button onClick={() => void exportFrame()}>PNG</button><button className="danger" onClick={deleteCut}>削除</button></div>
+              <div className="note-actions">
+                <button onClick={splitAtPlayhead}>分割</button>
+                <button onClick={duplicateCut} title="カットを複製 (Ctrl+D)">複製</button>
+                <button onClick={copyCutContent} title="カットの絵をコピー (Ctrl+C)">コピー</button>
+                <button onClick={pasteCutContent} title="カットの絵を貼り付け (Ctrl+Shift+V)">貼り付け</button>
+                <button onClick={() => void exportFrame()}>PNG</button>
+                <button className="danger" onClick={deleteCut}>削除</button>
+              </div>
             </aside>}
           </div>
         </section>
