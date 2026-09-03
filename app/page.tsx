@@ -34,13 +34,43 @@ import { STROKE_REFERENCE_WIDTH, canvasToPngBlob, drawContainedImage, paintStrok
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
 
-type Tool = "pen" | "eraser" | "line" | "rect" | "ellipse" | "lasso";
+type Tool = "pen" | "eraser" | "line" | "rect" | "ellipse" | "lasso" | "select";
 const SHAPE_TOOLS: { tool: Tool; label: string; hint: string }[] = [
   { tool: "line", label: "直線", hint: "直線 (L)" },
   { tool: "rect", label: "□", hint: "四角 (R)" },
   { tool: "ellipse", label: "○", hint: "円 (O)" },
   { tool: "lasso", label: "投げなわ塗", hint: "投げなわ塗 (G)" },
+  { tool: "select", label: "投げなわ選択", hint: "投げなわ選択 (M)" },
 ];
+
+/** Ray casting, in the same normalised frame coordinates the strokes use. */
+function pointInPolygon(point: Point, polygon: Point[]) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const a = polygon[i];
+    const b = polygon[j];
+    if ((a.y > point.y) !== (b.y > point.y)
+      && point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * A stroke belongs to the lasso when most of it does. Strokes are whole
+ * objects here, so a selection can only take them or leave them.
+ */
+function strokeInPolygon(stroke: Stroke, polygon: Point[]) {
+  if (!stroke.points.length) return false;
+  const inside = stroke.points.filter((point) => pointInPolygon(point, polygon)).length;
+  return inside * 2 > stroke.points.length;
+}
+
+const translateStroke = (stroke: Stroke, dx: number, dy: number): Stroke => ({
+  ...stroke,
+  points: stroke.points.map((point) => ({ x: point.x + dx, y: point.y + dy })),
+});
 
 /**
  * Points for a shape dragged from one corner to another. Shapes are stored as
@@ -83,14 +113,15 @@ const SHORTCUTS: [string, string][] = [
   ["B / E", "ペン / 消しゴム"],
   ["L / R / O", "直線 / 四角 / 円（Shiftで正方形・45度）"],
   ["G", "投げなわ塗"],
+  ["M", "投げなわ選択（ドラッグで移動、Deleteで削除）"],
   ["[ / ]", "ブラシを細く / 太く"],
   ["← / →", "1コマ移動（Shiftで1秒）"],
   [", / .", "前 / 次のカットへ"],
   ["Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直す"],
   ["Ctrl+V", "画像を現在のカットへ貼り付け"],
-  ["Ctrl+C / Ctrl+Shift+V", "カットの絵をコピー / 貼り付け"],
+  ["Ctrl+C / Ctrl+Shift+V", "選択範囲またはカットの絵をコピー / 貼り付け"],
   ["Ctrl+D", "カットを複製"],
-  ["Delete", "選択中のカットを削除"],
+  ["Delete", "選択範囲、なければカットを削除"],
   ["?", "このヘルプ"],
 ];
 
@@ -176,6 +207,7 @@ function drawCanvas(
   draft?: Stroke | null,
   thumbnail = false,
   resolution = 1,
+  selection?: Point[] | null,
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -213,6 +245,24 @@ function drawCanvas(
 
   // Stroke sizes are authored against the frame, so editor, thumbnail and export all match.
   [...strokes, ...(draft ? [draft] : [])].forEach((stroke) => paintStroke(ctx, stroke, frame, thumbnail ? .5 : 1));
+
+  if (selection && selection.length > 1 && !thumbnail) {
+    // Marching-ants outline so the selected region reads as a selection and
+    // never as part of the drawing.
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(20, 20, 20, .85)";
+    ctx.beginPath();
+    ctx.moveTo(frame.left + selection[0].x * frame.width, frame.top + selection[0].y * frame.height);
+    selection.slice(1).forEach((point) => ctx.lineTo(frame.left + point.x * frame.width, frame.top + point.y * frame.height));
+    ctx.closePath();
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255, 255, 255, .9)";
+    ctx.lineDashOffset = 5;
+    ctx.stroke();
+    ctx.restore();
+  }
 
   if (!thumbnail) {
     // Everything outside the frame is drawable but will not be exported, so dim it.
@@ -330,6 +380,10 @@ export default function Home() {
   const [canvasWidth, setCanvasWidth] = useState(0);
   /** Index of the cut card being dragged onto another to swap the drawings. */
   const [dragCutId, setDragCutId] = useState<string | null>(null);
+  /** The lasso selection: its outline plus which strokes it caught. */
+  const [selection, setSelection] = useState<{ polygon: Point[]; indexes: number[] } | null>(null);
+  /** Live offset while the selection is being dragged to a new place. */
+  const [selectionOffset, setSelectionOffset] = useState<Point | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -343,6 +397,10 @@ export default function Home() {
   const historyRef = useRef<Record<string, CutContent[]>>({});
   /** Cut content copied with Ctrl+C, pasted into another cut with Ctrl+Shift+V. */
   const cutClipboardRef = useRef<CutContent | null>(null);
+  /** Strokes copied out of a lasso selection, pasted in place. */
+  const strokeClipboardRef = useRef<Stroke[] | null>(null);
+  /** Where a selection drag started, so the offset can be measured. */
+  const selectionDragRef = useRef<Point | null>(null);
   const redoRef = useRef<Record<string, CutContent[]>>({});
   const roomRef = useRef<Room | null>(null);
   const roomIdRef = useRef<string | null>(null);
@@ -367,6 +425,7 @@ export default function Home() {
   useEffect(() => { projectRef.current = project; }, [project]);
   useEffect(() => { projectNameRef.current = projectName; }, [projectName]);
   useEffect(() => { setDurationInput(formatFrameDuration(activeDuration)); }, [activeDuration, activeId]);
+  useEffect(() => { setSelection(null); setSelectionOffset(null); }, [activeId, selectedTool]);
 
   /** Local edits go through here: the host owns state, guests only propose. */
   const mutate = useCallback((op: RoomOp) => {
@@ -498,19 +557,35 @@ export default function Home() {
     if (shouldReload) window.location.reload();
   }, [role]);
 
+  /** What the stage shows: a selection being dragged moves before it is committed. */
+  const displayStrokes = useMemo(() => {
+    if (!activeCut) return [];
+    if (!selection || !selectionOffset) return activeCut.strokes;
+    return activeCut.strokes.map((stroke, index) => (selection.indexes.includes(index)
+      ? translateStroke(stroke, selectionOffset.x, selectionOffset.y)
+      : stroke));
+  }, [activeCut, selection, selectionOffset]);
+
+  const displaySelection = useMemo(() => {
+    if (!selection) return null;
+    return selectionOffset
+      ? selection.polygon.map((point) => ({ x: point.x + selectionOffset.x, y: point.y + selectionOffset.y }))
+      : selection.polygon;
+  }, [selection, selectionOffset]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !activeCut) return;
-    drawCanvas(canvas, activeCut.strokes, activeBackgroundImage, draft, false, view.scale);
-  }, [activeCut, activeBackgroundImage, draft, panelOpen, view.scale]);
+    drawCanvas(canvas, displayStrokes, activeBackgroundImage, draft, false, view.scale, displaySelection);
+  }, [activeCut, activeBackgroundImage, displayStrokes, displaySelection, draft, panelOpen, view.scale]);
 
   useEffect(() => {
     const onResize = () => {
-      if (canvasRef.current && activeCut) drawCanvas(canvasRef.current, activeCut.strokes, activeBackgroundImage, draft, false, view.scale);
+      if (canvasRef.current && activeCut) drawCanvas(canvasRef.current, displayStrokes, activeBackgroundImage, draft, false, view.scale, displaySelection);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, [activeCut, activeBackgroundImage, draft, view.scale]);
+  }, [activeCut, activeBackgroundImage, displayStrokes, displaySelection, draft, view.scale]);
 
   // Playback position is intentionally local: every participant scrubs independently.
   useEffect(() => {
@@ -673,6 +748,21 @@ export default function Home() {
     }
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pointerPoint(event);
+
+    if (selectedTool === "select") {
+      // Starting inside an existing selection moves it; anywhere else draws a new lasso.
+      if (selection && pointInPolygon(point, selection.polygon)) {
+        selectionDragRef.current = point;
+        setSelectionOffset({ x: 0, y: 0 });
+        return;
+      }
+      setSelection(null);
+      setSelectionOffset(null);
+      shapeOriginRef.current = point;
+      setDraft({ color: "#3b6ea5", size: 1, points: [point] });
+      return;
+    }
+
     shapeOriginRef.current = point;
     setDraft({
       color,
@@ -684,6 +774,12 @@ export default function Home() {
   };
 
   const moveStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const dragStart = selectionDragRef.current;
+    if (dragStart) {
+      const point = pointerPoint(event);
+      setSelectionOffset({ x: point.x - dragStart.x, y: point.y - dragStart.y });
+      return;
+    }
     if (!draft || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
     const point = pointerPoint(event);
     const origin = shapeOriginRef.current;
@@ -698,7 +794,47 @@ export default function Home() {
 
   const endStroke = () => {
     shapeOriginRef.current = null;
+
+    // Committing a moved selection: the strokes it holds move with it.
+    if (selectionDragRef.current) {
+      selectionDragRef.current = null;
+      const offset = selectionOffset;
+      setSelectionOffset(null);
+      if (!selection || !offset || (!offset.x && !offset.y)) return;
+      const moved = activeCut.strokes.map((stroke, index) => (selection.indexes.includes(index)
+        ? translateStroke(stroke, offset.x, offset.y)
+        : stroke));
+      if (mutate({ type: "strokes", cutId: activeId, strokes: moved })) {
+        historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
+        redoRef.current[activeId] = [];
+        setSelection({
+          polygon: selection.polygon.map((point) => ({ x: point.x + offset.x, y: point.y + offset.y })),
+          indexes: selection.indexes,
+        });
+      }
+      return;
+    }
+
     if (!draft) return;
+
+    // The select tool never leaves a mark: its lasso becomes the selection.
+    if (selectedTool === "select") {
+      const polygon = draft.points;
+      setDraft(null);
+      if (polygon.length < 3) return;
+      const indexes = activeCut.strokes.reduce<number[]>((found, stroke, index) => {
+        if (strokeInPolygon(stroke, polygon)) found.push(index);
+        return found;
+      }, []);
+      if (!indexes.length) {
+        setToast("選択範囲に線がありませんでした");
+        return;
+      }
+      setSelection({ polygon, indexes });
+      setToast(`${indexes.length}本の線を選択しました（Ctrl+Cでコピー、ドラッグで移動）`);
+      return;
+    }
+
     if (mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] })) {
       historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
       redoRef.current[activeId] = [];
@@ -836,13 +972,41 @@ export default function Home() {
   const copyCutContent = useCallback(() => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     if (!cut) return;
+    if (selection?.indexes.length) {
+      strokeClipboardRef.current = selection.indexes.map((index) => cut.strokes[index]).filter(Boolean);
+      cutClipboardRef.current = null;
+      setToast(`選択範囲の${strokeClipboardRef.current.length}本をコピーしました`);
+      return;
+    }
     cutClipboardRef.current = cutContent(cut);
+    strokeClipboardRef.current = null;
     setToast("カットの絵をコピーしました");
-  }, [activeId]);
+  }, [activeId, selection]);
+
+  /** Drops the selected strokes, leaving the rest of the cut alone. */
+  const deleteSelection = useCallback(() => {
+    const cut = projectRef.current.cuts.find((item) => item.id === activeId);
+    if (!cut || !selection) return;
+    const strokes = cut.strokes.filter((_, index) => !selection.indexes.includes(index));
+    if (mutate({ type: "strokes", cutId: activeId, strokes })) {
+      rememberContent(cut);
+      setSelection(null);
+      setToast("選択範囲を削除しました");
+    }
+  }, [activeId, mutate, selection]);
 
   const pasteCutContent = useCallback(() => {
-    const copied = cutClipboardRef.current;
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
+    const copiedStrokes = strokeClipboardRef.current;
+    if (copiedStrokes?.length && cut) {
+      // A copied selection lands on top of the cut, in the place it was cut from.
+      if (mutate({ type: "strokes", cutId: activeId, strokes: [...cut.strokes, ...copiedStrokes] })) {
+        rememberContent(cut);
+        setToast(`選択範囲の${copiedStrokes.length}本を貼り付けました`);
+      }
+      return;
+    }
+    const copied = cutClipboardRef.current;
     if (!copied || !cut) {
       setToast("コピーされたカットがありません");
       return;
@@ -1059,16 +1223,17 @@ export default function Home() {
         case "ArrowRight": event.preventDefault(); seek(currentTime + step); break;
         case ",": chooseCut(activeIndex - 1); break;
         case ".": chooseCut(activeIndex + 1); break;
-        case "Delete": deleteCut(); break;
+        case "m": case "M": setSelectedTool("select"); break;
+        case "Delete": if (selection) deleteSelection(); else deleteCut(); break;
         case "?": setHelpOpen((open) => !open); break;
-        case "Escape": setHelpOpen(false); break;
+        case "Escape": setHelpOpen(false); setSelection(null); break;
         default: break;
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [busy, currentTime, activeIndex, togglePlay, splitAtPlayhead, deleteCut, chooseCut, seek, undo, redo,
-    copyCutContent, pasteCutContent, duplicateCut]);
+    copyCutContent, pasteCutContent, duplicateCut, deleteSelection, selection]);
 
   const onTimelinePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
