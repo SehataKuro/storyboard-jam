@@ -57,6 +57,14 @@ export class SignalRoom {
       } catch {
         return;
       }
+      if (message.type === "kick" && message.to && id === this.hostId) {
+        const evicted = this.peers.get(message.to);
+        if (!evicted) return;
+        this.send(evicted, { type: "kicked" });
+        try { evicted.socket.close(1000, "removed by host"); } catch { /* already closing */ }
+        this.drop(message.to);
+        return;
+      }
       if (message.type !== "signal" || !message.to) return;
       const target = this.peers.get(message.to);
       if (target) this.send(target, { type: "signal", from: id, payload: message.payload });

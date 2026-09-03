@@ -19,6 +19,8 @@ export type RoomOp =
 
 export type RoomRole = "connecting" | "host" | "guest" | "closed";
 export type RoomSnapshot = { project: Project; projectName: string };
+/** Everyone currently in the room, as the host sees it. */
+export type Participant = { id: string; name: string; isHost: boolean };
 
 export type RoomHandlers = {
   onRole: (role: RoomRole) => void;
@@ -28,6 +30,10 @@ export type RoomHandlers = {
   onSnapshot: (snapshot: RoomSnapshot) => void;
   /** Host side: an edit proposed by a guest. */
   onOp: (op: RoomOp) => void;
+  /** Everyone in the room, host first. Kept by the host and pushed to guests. */
+  onRoster: (participants: Participant[]) => void;
+  /** The host removed us from the room, so there is nothing to reconnect to. */
+  onEvicted: () => void;
   getSnapshot: () => RoomSnapshot;
 };
 
@@ -47,6 +53,11 @@ export class Room {
   private role: RoomRole = "connecting";
   private hostId: string | null = null;
   private closedByUs = false;
+  private selfId: string | null = null;
+  private selfName = "";
+  /** Host only: the display name each guest sent over its data channel. */
+  private names = new Map<string, string>();
+  private evicted = false;
 
   constructor(private room: string, private handlers: RoomHandlers) {}
 
@@ -59,7 +70,7 @@ export class Room {
     socket.onmessage = (event) => void this.onSignalMessage(JSON.parse(event.data as string));
     socket.onerror = () => this.handlers.onStatus("シグナリングに接続できません");
     socket.onclose = () => {
-      if (this.closedByUs) return;
+      if (this.closedByUs || this.evicted) return;
       const wasHost = this.role === "host";
       this.setRole("closed");
       this.handlers.onStatus(wasHost ? "ルームを終了しました" : "ホストが退出したため切断しました");
@@ -77,6 +88,42 @@ export class Room {
 
   isHost() {
     return this.role === "host";
+  }
+
+  /** Tells the room who we are. The host owns the roster and republishes it. */
+  setName(name: string) {
+    this.selfName = name;
+    if (this.role === "host") {
+      this.publishRoster();
+      return;
+    }
+    const link = this.hostId ? this.links.get(this.hostId) : null;
+    if (link?.channel?.readyState === "open") link.channel.send(JSON.stringify({ type: "hello", name }));
+  }
+
+  /** Host only: remove a guest from the room. */
+  kick(peerId: string) {
+    if (this.role !== "host" || peerId === this.selfId) return;
+    this.socket?.send(JSON.stringify({ type: "kick", to: peerId }));
+    this.links.get(peerId)?.pc.close();
+    this.links.delete(peerId);
+    this.names.delete(peerId);
+    this.handlers.onPeers(this.links.size);
+    this.publishRoster();
+  }
+
+  /** Host only: build the roster and send it to every guest. */
+  private publishRoster() {
+    if (this.role !== "host") return;
+    const participants: Participant[] = [
+      { id: this.selfId || "host", name: this.selfName, isHost: true },
+      ...[...this.links.keys()].map((id) => ({ id, name: this.names.get(id) || "", isHost: false })),
+    ];
+    this.handlers.onRoster(participants);
+    const payload = JSON.stringify({ type: "roster", participants });
+    this.links.forEach((link) => {
+      if (link.channel?.readyState === "open") link.channel.send(payload);
+    });
   }
 
   /** Closed rooms remain locally editable; guests wait for the data channel. */
@@ -121,8 +168,20 @@ export class Room {
   }) {
     if (message.type === "welcome") {
       this.hostId = message.hostId || null;
+      this.selfId = message.peerId || null;
       this.setRole(message.isHost ? "host" : "guest");
       this.handlers.onStatus(message.isHost ? "ホストとしてルームを開きました" : "ホストへ接続中…");
+      if (message.isHost) this.publishRoster();
+      return;
+    }
+
+    if (message.type === "kicked") {
+      this.evicted = true;
+      this.closedByUs = true;
+      this.setRole("closed");
+      this.handlers.onStatus("ホストによってルームから退出させられました");
+      this.teardownLinks();
+      this.handlers.onEvicted();
       return;
     }
 
@@ -134,7 +193,9 @@ export class Room {
     if (message.type === "peer-leave" && message.peerId) {
       this.links.get(message.peerId)?.pc.close();
       this.links.delete(message.peerId);
+      this.names.delete(message.peerId);
       this.handlers.onPeers(this.links.size);
+      this.publishRoster();
       return;
     }
 
@@ -173,18 +234,37 @@ export class Room {
       if (this.role === "host") {
         channel.send(JSON.stringify({ type: "snapshot", ...this.handlers.getSnapshot() }));
         this.handlers.onStatus("参加者が入室しました");
+        this.publishRoster();
       } else {
         this.handlers.onStatus("ホストに接続しました");
+        channel.send(JSON.stringify({ type: "hello", name: this.selfName }));
       }
     };
     channel.onmessage = (event) => {
-      const data = JSON.parse(event.data as string) as { type: string; project?: Project; projectName?: string; op?: RoomOp };
+      const data = JSON.parse(event.data as string) as {
+        type: string;
+        project?: Project;
+        projectName?: string;
+        op?: RoomOp;
+        name?: string;
+        participants?: Participant[];
+      };
       if (data.type === "snapshot" && data.project && this.role === "guest") {
         this.handlers.onSnapshot({ project: data.project, projectName: data.projectName || "" });
       }
       if (data.type === "op" && data.op && this.role === "host") this.handlers.onOp(data.op);
+      if (data.type === "hello" && this.role === "host") {
+        this.names.set(peerId, data.name || "");
+        this.publishRoster();
+      }
+      if (data.type === "roster" && data.participants && this.role === "guest") {
+        this.handlers.onRoster(data.participants);
+      }
     };
-    channel.onclose = () => this.handlers.onPeers(this.links.size);
+    channel.onclose = () => {
+      this.handlers.onPeers(this.links.size);
+      this.publishRoster();
+    };
   }
 
   private async inviteGuest(peerId: string) {
@@ -228,7 +308,9 @@ export class Room {
   private teardownLinks() {
     this.links.forEach((link) => link.pc.close());
     this.links.clear();
+    this.names.clear();
     this.handlers.onPeers(0);
+    this.handlers.onRoster([]);
   }
 }
 

@@ -25,7 +25,7 @@ import {
   parseFrameDuration,
   snapToFrame,
 } from "./lib/types";
-import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
+import { Participant, Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
@@ -105,6 +105,10 @@ function shapePoints(tool: Tool, from: Point, to: Point, constrain: boolean): Po
   });
 }
 const LEGACY_STORAGE_KEY = "conte-live-project";
+const NAME_STORAGE_KEY = "conte-live-name";
+/** Shown for anyone who has not typed a name yet. */
+const guestLabel = (participant: Participant, index: number) =>
+  participant.name.trim() || (participant.isHost ? "ホスト" : `ゲスト${index}`);
 const roomStorageKey = (roomId: string) => `${LEGACY_STORAGE_KEY}:${roomId}`;
 
 const SHORTCUTS: [string, string][] = [
@@ -384,6 +388,12 @@ export default function Home() {
   const [selection, setSelection] = useState<{ polygon: Point[]; indexes: number[] } | null>(null);
   /** Live offset while the selection is being dragged to a new place. */
   const [selectionOffset, setSelectionOffset] = useState<Point | null>(null);
+  /** Everyone in the room, as published by the host. */
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [userName, setUserName] = useState("");
+  const [peopleOpen, setPeopleOpen] = useState(false);
+  /** True once the host has removed us, so reconnecting is not offered. */
+  const [evicted, setEvicted] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -440,6 +450,20 @@ export default function Home() {
     if (room.isHost()) room.broadcastSnapshot(next, projectNameRef.current);
     else room.sendOp(op);
     return true;
+  }, []);
+
+  const renameUser = useCallback((value: string) => {
+    setUserName(value);
+    try {
+      window.localStorage.setItem(NAME_STORAGE_KEY, value);
+    } catch { /* a missing name is not worth interrupting the session */ }
+    roomRef.current?.setName(value);
+  }, []);
+
+  const kickParticipant = useCallback((participant: Participant, index: number) => {
+    if (!window.confirm(`${guestLabel(participant, index)} をルームから退出させますか？`)) return;
+    roomRef.current?.kick(participant.id);
+    setToast(`${guestLabel(participant, index)} を退出させました`);
   }, []);
 
   const renameProject = useCallback((value: string) => {
@@ -513,6 +537,9 @@ export default function Home() {
       window.setTimeout(() => setCollabPulse(false), 900);
     };
 
+    const storedName = window.localStorage.getItem(NAME_STORAGE_KEY) || "";
+    setUserName(storedName);
+
     const room = new Room(roomId, {
       onRole: setRole,
       onStatus: setToast,
@@ -525,6 +552,8 @@ export default function Home() {
         setActiveId((current) => (incoming.project.cuts.some((cut) => cut.id === current) ? current : incoming.project.cuts[0]?.id || current));
         pulse();
       },
+      onRoster: setParticipants,
+      onEvicted: () => setEvicted(true),
       onOp: (op) => {
         if (op.type === "rename") {
           projectNameRef.current = op.value;
@@ -543,19 +572,20 @@ export default function Home() {
     });
     roomRef.current = room;
     room.connect();
+    room.setName(storedName);
     return () => { room.close(); roomRef.current = null; };
   }, []);
 
   useEffect(() => {
     const previousRole = previousRoleRef.current;
     previousRoleRef.current = role;
-    if (previousRole !== "guest" || role !== "closed") return;
+    if (previousRole !== "guest" || role !== "closed" || evicted) return;
 
     const shouldReload = window.confirm(
       "ホストとの接続が切断されました。再読み込みして再接続しますか？",
     );
     if (shouldReload) window.location.reload();
-  }, [role]);
+  }, [role, evicted]);
 
   /** What the stage shows: a selection being dragged moves before it is committed. */
   const displayStrokes = useMemo(() => {
@@ -1428,8 +1458,31 @@ export default function Home() {
         </div>
         <div className="people" aria-label="参加中のメンバー">
           <span className="presence-text" title={ROLE_LABEL[role]}><i className={collabPulse ? "pulse" : ""} />{ROLE_LABEL[role]}</span>
-          <div className="avatars"><span className="av av1">YOU</span>{peers > 0 && <span className="av av2">+{peers}</span>}</div>
+          <BufferedField className="user-name" aria-label="あなたの名前" placeholder="あなたの名前"
+            value={userName} onCommit={renameUser} />
+          <button className="people-toggle" onClick={() => setPeopleOpen((open) => !open)}
+            aria-expanded={peopleOpen} title="参加者一覧">
+            参加者 {Math.max(1, participants.length || peers + 1)}
+          </button>
           <button className="share" onClick={() => void shareRoom()}>招待する</button>
+          {peopleOpen && (
+            <div className="people-list" role="dialog" aria-label="参加者一覧">
+              <div className="people-head"><span>参加者</span><button onClick={() => setPeopleOpen(false)}>×</button></div>
+              <ul>
+                {(participants.length ? participants : [{ id: "self", name: userName, isHost: role === "host" }]).map((participant, index) => (
+                  <li key={participant.id}>
+                    <span className="av av1">{guestLabel(participant, index).slice(0, 2)}</span>
+                    <b>{guestLabel(participant, index)}</b>
+                    {participant.isHost && <small>ホスト</small>}
+                    {role === "host" && !participant.isHost && (
+                      <button className="kick" onClick={() => kickParticipant(participant, index)}>退出</button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {role !== "host" && <p className="field-hint">退出させられるのはホストだけです</p>}
+            </div>
+          )}
         </div>
       </header>
 
