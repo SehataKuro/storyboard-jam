@@ -114,6 +114,14 @@ button { cursor:pointer; }
 /* --- timeline zoom, volume, shortcuts --- */
 .timeline-viewport { min-width:0; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; overscroll-behavior-x:contain; }
 .timeline-viewport.panning { cursor:grabbing; }
+
+/* --- stage navigation --- */
+.drawing-canvas { transform-origin:center; will-change:transform; }
+.brush-ring { position:fixed; z-index:5; transform:translate(-50%,-50%); border-radius:50%; border:1px solid rgba(255,255,255,.85); box-shadow:0 0 0 1px rgba(0,0,0,.45); pointer-events:none; }
+.stage-view-control { position:absolute; right:10px; bottom:8px; display:flex; align-items:center; gap:4px; padding:4px 6px; border-radius:7px; background:rgba(37,35,30,.78); color:#f2ece1; font-size:9px; z-index:6; }
+.stage-view-control button { border:0; background:rgba(255,255,255,.12); color:inherit; border-radius:4px; padding:3px 6px; font-size:10px; line-height:1; }
+.stage-view-control button:hover { background:rgba(255,255,255,.26); }
+.stage-view-control b { min-width:34px; text-align:center; font-variant-numeric:tabular-nums; }
 .timeline-viewport .timeline { min-width:100%; margin:0 0 10px; }
 .view-control { display:flex; align-items:center; gap:5px; color:#9a958d; font-size:11px; }
 .view-control button { border:1px solid #5c5851; background:transparent; color:#cfcac1; border-radius:4px; width:20px; height:20px; line-height:1; padding:0; }

@@ -62,6 +62,8 @@ const MAX_STAGE_WIDTH = 1120;
 const MIN_TIMELINE_ZOOM = 1;
 const MAX_TIMELINE_ZOOM = 40;
 const clamp = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
+const MIN_VIEW_SCALE = 0.2;
+const MAX_VIEW_SCALE = 8;
 type CutContent = Pick<Cut, "strokes" | "backgroundImage">;
 
 const cutContent = (cut: Cut): CutContent => ({
@@ -127,11 +129,12 @@ function drawCanvas(
   backgroundImage: HTMLImageElement | null,
   draft?: Stroke | null,
   thumbnail = false,
+  resolution = 1,
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   if (!thumbnail) fitCanvas(canvas);
-  const dpr = thumbnail ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = thumbnail ? 1 : Math.min((window.devicePixelRatio || 1) * Math.max(1, resolution), 3);
   const rect = canvas.getBoundingClientRect();
   const width = Math.max(1, rect.width);
   const height = Math.max(1, rect.height);
@@ -288,9 +291,18 @@ export default function Home() {
   const [scrubbing, setScrubbing] = useState(false);
   /** True while the timeline is being panned with the middle button. */
   const [panning, setPanning] = useState(false);
+  /** How the drawing stage is being looked at: zoom, rotation and offset. */
+  const [view, setView] = useState({ scale: 1, angle: 0, x: 0, y: 0 });
+  /** Follows the pointer over the stage so the brush shows its real size. */
+  const [brushRing, setBrushRing] = useState<{ x: number; y: number } | null>(null);
+  /** Which stage navigation gesture the middle button started, if any. */
+  const [stageDrag, setStageDrag] = useState<"pan" | "rotate" | null>(null);
+  /** Laid-out width of the stage, used to size the brush ring. */
+  const [canvasWidth, setCanvasWidth] = useState(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
   const dragIndexRef = useRef(-1);
   const animationRef = useRef<number | null>(null);
@@ -454,16 +466,16 @@ export default function Home() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !activeCut) return;
-    drawCanvas(canvas, activeCut.strokes, activeBackgroundImage, draft);
-  }, [activeCut, activeBackgroundImage, draft, panelOpen]);
+    drawCanvas(canvas, activeCut.strokes, activeBackgroundImage, draft, false, view.scale);
+  }, [activeCut, activeBackgroundImage, draft, panelOpen, view.scale]);
 
   useEffect(() => {
     const onResize = () => {
-      if (canvasRef.current && activeCut) drawCanvas(canvasRef.current, activeCut.strokes, activeBackgroundImage, draft);
+      if (canvasRef.current && activeCut) drawCanvas(canvasRef.current, activeCut.strokes, activeBackgroundImage, draft, false, view.scale);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, [activeCut, activeBackgroundImage, draft]);
+  }, [activeCut, activeBackgroundImage, draft, view.scale]);
 
   // Playback position is intentionally local: every participant scrubs independently.
   useEffect(() => {
@@ -531,17 +543,95 @@ export default function Home() {
     }
   }, [playing, currentTime, totalDuration, audioUrl, seek]);
 
+  /**
+   * Client pixels to untransformed canvas pixels. The bounding box is useless
+   * once the stage is rotated, so the view transform is inverted by hand
+   * around the stage centre.
+   */
+  const canvasPoint = useCallback((clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    const stage = stageRef.current;
+    if (!canvas || !stage) return { x: 0, y: 0, width: 1, height: 1 };
+    const box = stage.getBoundingClientRect();
+    const dx = clientX - (box.left + box.width / 2) - view.x;
+    const dy = clientY - (box.top + box.height / 2) - view.y;
+    const cos = Math.cos(-view.angle);
+    const sin = Math.sin(-view.angle);
+    const width = canvas.offsetWidth || 1;
+    const height = canvas.offsetHeight || 1;
+    return {
+      x: (dx * cos - dy * sin) / view.scale + width / 2,
+      y: (dx * sin + dy * cos) / view.scale + height / 2,
+      width,
+      height,
+    };
+  }, [view]);
+
   // Coordinates are normalised against the frame, so values outside 0..1 sit in the margin.
   const pointerPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const frame = frameBox(rect.width, rect.height, true);
+    const local = canvasPoint(event.clientX, event.clientY);
+    const frame = frameBox(local.width, local.height, true);
     return {
-      x: (event.clientX - rect.left - frame.left) / frame.width,
-      y: (event.clientY - rect.top - frame.top) / frame.height,
+      x: (local.x - frame.left) / frame.width,
+      y: (local.y - frame.top) / frame.height,
     };
   };
 
+  const resetView = useCallback(() => setView({ scale: 1, angle: 0, x: 0, y: 0 }), []);
+
+  // Clip Studio style stage navigation: the wheel zooms at the cursor, the
+  // middle button pans and shift+middle rotates.
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const box = stage.getBoundingClientRect();
+      const pointerX = event.clientX - (box.left + box.width / 2);
+      const pointerY = event.clientY - (box.top + box.height / 2);
+      setView((current) => {
+        const scale = clamp(current.scale * Math.exp(-event.deltaY * 0.0015), MIN_VIEW_SCALE, MAX_VIEW_SCALE);
+        const factor = scale / current.scale;
+        return {
+          ...current,
+          scale,
+          x: pointerX - (pointerX - current.x) * factor,
+          y: pointerY - (pointerY - current.y) * factor,
+        };
+      });
+    };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, []);
+
+  const beginStageNavigation = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 1) return;
+    event.preventDefault();
+    setStageDrag(event.shiftKey ? "rotate" : "pan");
+  };
+
+  useEffect(() => {
+    if (!stageDrag) return;
+    const onMove = (event: PointerEvent) => {
+      if (stageDrag === "pan") {
+        setView((current) => ({ ...current, x: current.x + event.movementX, y: current.y + event.movementY }));
+        return;
+      }
+      setView((current) => ({ ...current, angle: current.angle + event.movementX * 0.005 }));
+    };
+    const onUp = () => setStageDrag(null);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [stageDrag]);
+
   const beginStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (event.button !== 0) return;
     if (!roomRef.current?.canEdit()) {
       setToast("接続が完了してから編集してください");
       return;
@@ -992,6 +1082,23 @@ export default function Home() {
     };
   }, [panning]);
 
+  // The stage is resized by its container, so its width is watched rather than
+  // read during render.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const observer = new ResizeObserver(([entry]) => setCanvasWidth(entry.contentRect.width));
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  /** The ring shows the stroke as it will land on the paper, zoom included. */
+  const brushRingSize = useMemo(() => {
+    const frameWidth = frameBox(canvasWidth, canvasWidth, true).width;
+    const size = selectedTool === "eraser" ? brushSize * 4 : brushSize;
+    return Math.max(4, size * (frameWidth / STROKE_REFERENCE_WIDTH) * view.scale);
+  }, [brushSize, canvasWidth, selectedTool, view.scale]);
+
   const rulerMarks = useMemo(() => {
     const count = Math.min(21, 5 * Math.round(zoom));
     return Array.from({ length: count }, (_, index) => index / (count - 1));
@@ -1068,9 +1175,24 @@ export default function Home() {
           </div>
 
           <div className={`canvas-and-note ${panelOpen ? "" : "note-closed"}`}>
-            <div className="canvas-wrap">
+            <div className="canvas-wrap" ref={stageRef} onPointerDown={beginStageNavigation}
+              onAuxClick={(e) => e.preventDefault()}
+              onPointerMove={(e) => setBrushRing({ x: e.clientX, y: e.clientY })}
+              onPointerLeave={() => setBrushRing(null)}>
               <div className="canvas-label"><span>CUT {String(activeIndex + 1).padStart(2, "0")}</span><span>{activeCut?.title}</span></div>
-              <canvas ref={canvasRef} className="drawing-canvas" onPointerDown={beginStroke} onPointerMove={moveStroke} onPointerUp={endStroke} onPointerCancel={endStroke} aria-label="絵コンテ描画キャンバス" />
+              <canvas ref={canvasRef} className="drawing-canvas"
+                style={{ transform: `translate(${view.x}px, ${view.y}px) rotate(${view.angle}rad) scale(${view.scale})` }}
+                onPointerDown={beginStroke} onPointerMove={moveStroke} onPointerUp={endStroke} onPointerCancel={endStroke} aria-label="絵コンテ描画キャンバス" />
+              {brushRing && <span className="brush-ring" aria-hidden="true"
+                style={{ left: brushRing.x, top: brushRing.y, width: brushRingSize, height: brushRingSize }} />}
+              <div className="stage-view-control">
+                <button onClick={() => setView((v) => ({ ...v, scale: clamp(v.scale / 1.4, MIN_VIEW_SCALE, MAX_VIEW_SCALE) }))} aria-label="キャンバスを縮小">−</button>
+                <b>{Math.round(view.scale * 100)}%</b>
+                <button onClick={() => setView((v) => ({ ...v, scale: clamp(v.scale * 1.4, MIN_VIEW_SCALE, MAX_VIEW_SCALE) }))} aria-label="キャンバスを拡大">＋</button>
+                <button onClick={() => setView((v) => ({ ...v, angle: v.angle - Math.PI / 12 }))} aria-label="左に回転">⟲</button>
+                <button onClick={() => setView((v) => ({ ...v, angle: v.angle + Math.PI / 12 }))} aria-label="右に回転">⟳</button>
+                <button onClick={resetView} title="表示をリセット">リセット</button>
+              </div>
             </div>
             {panelOpen && <aside className="note-panel">
               <div className="note-head"><span>カット情報</span><button onClick={() => setPanelOpen(false)}>×</button></div>
