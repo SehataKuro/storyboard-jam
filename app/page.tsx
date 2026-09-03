@@ -84,7 +84,7 @@ const SHORTCUTS: [string, string][] = [
   ["L / R / O", "直線 / 四角 / 円（Shiftで正方形・45度）"],
   ["G", "投げなわ塗"],
   ["[ / ]", "ブラシを細く / 太く"],
-  ["← / →", "1秒移動（Shiftで1フレーム）"],
+  ["← / →", "1コマ移動（Shiftで1秒）"],
   [", / .", "前 / 次のカットへ"],
   ["Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直す"],
   ["Ctrl+V", "画像を現在のカットへ貼り付け"],
@@ -1019,7 +1019,7 @@ export default function Home() {
       if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
       if (busy) return;
 
-      const step = event.shiftKey ? 1 / DEFAULT_FPS : 1;
+      const step = event.shiftKey ? 1 : 1 / DEFAULT_FPS;
       const key = event.key;
 
       if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "z") {
