@@ -1432,7 +1432,7 @@ export default function Home() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark">C</span><span>CONTE</span><b>LIVE</b></div>
+        <div className="brand"><span className="brand-mark">S</span><span>STORYBOARD</span><b>JAM</b></div>
         <div className="project-title">
           <button className="crumb">Projects</button><span>/</span>
           <BufferedField aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName}

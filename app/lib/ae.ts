@@ -17,7 +17,7 @@ export function buildAeScript(project: Project, options: { fps: number; width: n
     `  { name: "${escapeJs(cutLabel(cut.title, index))}", start: ${cut.start.toFixed(6)}, duration: ${cutDurationOf(project, index).toFixed(6)}, note: "${escapeJs(cut.note)}" }`,
   ).join(",\n");
 
-  return `// CONTE LIVE -> After Effects
+  return `// STORYBOARD JAM -> After Effects
 // After Effects で [ファイル > スクリプト > スクリプトファイルを実行] から実行してください。
 // images フォルダ内の1枚目を選ぶと、コンポとタイムリマップのキーを自動生成します。
 (function () {
@@ -33,7 +33,7 @@ ${rows}
   var first = File.openDialog("images フォルダ内の1枚目（cut_0001.png）を選択してください");
   if (!first) { return; }
 
-  app.beginUndoGroup("CONTE LIVE Import");
+  app.beginUndoGroup("STORYBOARD JAM Import");
   try {
     var io = new ImportOptions(first);
     if (io.canImportAs(ImportAsType.FOOTAGE)) { io.importAs = ImportAsType.FOOTAGE; }
@@ -73,9 +73,9 @@ ${rows}
     }
 
     comp.openInViewer();
-    alert("CONTE LIVE: " + CUTS.length + "カットを読み込みました。");
+    alert("STORYBOARD JAM: " + CUTS.length + "カットを読み込みました。");
   } catch (error) {
-    alert("CONTE LIVE: 読み込みに失敗しました\\n" + error.toString());
+    alert("STORYBOARD JAM: 読み込みに失敗しました\\n" + error.toString());
   }
   app.endUndoGroup();
 })();

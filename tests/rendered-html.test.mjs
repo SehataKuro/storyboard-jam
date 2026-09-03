@@ -26,7 +26,7 @@ test("server-renders the storyboard editor", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>CONTE LIVE/);
+  assert.match(html, /<title>STORYBOARD JAM/);
   assert.match(html, /絵コンテ描画キャンバス/);
   assert.match(html, /プロジェクト名/);
   assert.match(html, /連番＋AE/);
