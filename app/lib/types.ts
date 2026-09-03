@@ -1,5 +1,12 @@
 export type Point = { x: number; y: number };
-export type Stroke = { color: string; size: number; points: Point[]; eraser?: boolean };
+export type Stroke = {
+  color: string;
+  size: number;
+  points: Point[];
+  eraser?: boolean;
+  /** A closed region painted solid, as left by the lasso fill tool. */
+  fill?: boolean;
+};
 
 /**
  * A cut is a boundary on the song timeline, not a length of its own.

@@ -55,6 +55,7 @@ button { cursor:pointer; }
 .pen-icon { display:block; width:4px; height:19px; border-radius:2px; background:#3d3932; transform:rotate(35deg); margin:auto; }
 .eraser-icon { display:block; width:15px; height:10px; border:2px solid #4d4840; border-radius:2px; transform:rotate(-35deg); margin:auto; }
 .divider { width:1px; height:23px; background:var(--line); margin:0 6px; }
+.tools .shape-tool { font-size:10px; padding:0 8px; border-color:#d8d1c4; }
 .tools .swatch { min-width:18px; width:18px; height:18px; border-radius:50%; background:var(--swatch); padding:0; margin:0 2px; box-shadow:inset 0 0 0 1px rgba(0,0,0,.12); }
 .tools .swatch.selected { outline:2px solid #fff; box-shadow:0 0 0 2px var(--accent); }
 .size-control { display:flex; gap:7px; align-items:center; font-size:10px; color:#777166; }

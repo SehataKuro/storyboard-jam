@@ -30,9 +30,50 @@ import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
 import { readBundleFromFiles, readBundleFromZip } from "./lib/project-io";
-import { STROKE_REFERENCE_WIDTH, canvasToPngBlob, drawContainedImage, renderCutToCanvas } from "./lib/render";
+import { STROKE_REFERENCE_WIDTH, canvasToPngBlob, drawContainedImage, paintStroke, renderCutToCanvas } from "./lib/render";
 
 const COLORS = ["#171714", "#ff5b3d", "#367c5b", "#2f6fc0", "#8e56a8"];
+
+type Tool = "pen" | "eraser" | "line" | "rect" | "ellipse" | "lasso";
+const SHAPE_TOOLS: { tool: Tool; label: string; hint: string }[] = [
+  { tool: "line", label: "直線", hint: "直線 (L)" },
+  { tool: "rect", label: "□", hint: "四角 (R)" },
+  { tool: "ellipse", label: "○", hint: "円 (O)" },
+  { tool: "lasso", label: "投げなわ塗", hint: "投げなわ塗 (G)" },
+];
+
+/**
+ * Points for a shape dragged from one corner to another. Shapes are stored as
+ * ordinary strokes, so nothing downstream needs to know about them.
+ */
+function shapePoints(tool: Tool, from: Point, to: Point, constrain: boolean): Point[] {
+  let end = to;
+  if (constrain) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    if (tool === "line") {
+      // Snap to the nearest eighth turn, the way a set square would.
+      const length = Math.hypot(dx, dy);
+      const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+      end = { x: from.x + Math.cos(angle) * length, y: from.y + Math.sin(angle) * length };
+    } else {
+      const size = Math.max(Math.abs(dx), Math.abs(dy));
+      end = { x: from.x + Math.sign(dx) * size, y: from.y + Math.sign(dy) * size };
+    }
+  }
+  if (tool === "line") return [from, end];
+  if (tool === "rect") {
+    return [from, { x: end.x, y: from.y }, end, { x: from.x, y: end.y }, from];
+  }
+  const cx = (from.x + end.x) / 2;
+  const cy = (from.y + end.y) / 2;
+  const rx = (end.x - from.x) / 2;
+  const ry = (end.y - from.y) / 2;
+  return Array.from({ length: 49 }, (_, index) => {
+    const angle = (index / 48) * Math.PI * 2;
+    return { x: cx + Math.cos(angle) * rx, y: cy + Math.sin(angle) * ry };
+  });
+}
 const LEGACY_STORAGE_KEY = "conte-live-project";
 const roomStorageKey = (roomId: string) => `${LEGACY_STORAGE_KEY}:${roomId}`;
 
@@ -40,6 +81,8 @@ const SHORTCUTS: [string, string][] = [
   ["Space", "再生 / 停止"],
   ["S", "再生位置でカットを分割"],
   ["B / E", "ペン / 消しゴム"],
+  ["L / R / O", "直線 / 四角 / 円（Shiftで正方形・45度）"],
+  ["G", "投げなわ塗"],
   ["[ / ]", "ブラシを細く / 太く"],
   ["← / →", "1秒移動（Shiftで1フレーム）"],
   [", / .", "前 / 次のカットへ"],
@@ -169,24 +212,7 @@ function drawCanvas(
   }
 
   // Stroke sizes are authored against the frame, so editor, thumbnail and export all match.
-  const strokeScale = frame.width / STROKE_REFERENCE_WIDTH;
-  [...strokes, ...(draft ? [draft] : [])].forEach((stroke) => {
-    if (stroke.points.length < 1) return;
-    ctx.globalCompositeOperation = stroke.eraser ? "destination-out" : "source-over";
-    ctx.strokeStyle = stroke.color;
-    ctx.lineWidth = Math.max(thumbnail ? .5 : 1, stroke.size * strokeScale);
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    const first = stroke.points[0];
-    ctx.moveTo(frame.left + first.x * frame.width, frame.top + first.y * frame.height);
-    stroke.points.slice(1).forEach((p) => ctx.lineTo(frame.left + p.x * frame.width, frame.top + p.y * frame.height));
-    if (stroke.points.length === 1) {
-      ctx.lineTo(frame.left + first.x * frame.width + .1, frame.top + first.y * frame.height + .1);
-    }
-    ctx.stroke();
-    ctx.globalCompositeOperation = "source-over";
-  });
+  [...strokes, ...(draft ? [draft] : [])].forEach((stroke) => paintStroke(ctx, stroke, frame, thumbnail ? .5 : 1));
 
   if (!thumbnail) {
     // Everything outside the frame is drawable but will not be exported, so dim it.
@@ -268,7 +294,7 @@ const ROLE_LABEL: Record<RoomRole, string> = {
 export default function Home() {
   const [project, setProject] = useState<Project>(() => createEmptyProject());
   const [activeId, setActiveId] = useState("");
-  const [selectedTool, setSelectedTool] = useState<"pen" | "eraser">("pen");
+  const [selectedTool, setSelectedTool] = useState<Tool>("pen");
   const [color, setColor] = useState(COLORS[0]);
   const [brushSize, setBrushSize] = useState(3);
   const [currentTime, setCurrentTime] = useState(0);
@@ -310,6 +336,8 @@ export default function Home() {
   const stageRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
   const dragIndexRef = useRef(-1);
+  /** Where a shape drag started, in frame coordinates. */
+  const shapeOriginRef = useRef<Point | null>(null);
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
   const historyRef = useRef<Record<string, CutContent[]>>({});
@@ -644,16 +672,32 @@ export default function Home() {
       return;
     }
     event.currentTarget.setPointerCapture(event.pointerId);
-    setDraft({ color, size: selectedTool === "eraser" ? brushSize * 4 : brushSize, eraser: selectedTool === "eraser", points: [pointerPoint(event)] });
+    const point = pointerPoint(event);
+    shapeOriginRef.current = point;
+    setDraft({
+      color,
+      size: selectedTool === "eraser" ? brushSize * 4 : brushSize,
+      eraser: selectedTool === "eraser",
+      fill: selectedTool === "lasso" ? true : undefined,
+      points: [point],
+    });
   };
 
   const moveStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!draft || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
     const point = pointerPoint(event);
+    const origin = shapeOriginRef.current;
+    // A shape is re-derived from its two corners; pen, eraser and lasso trail.
+    if (origin && (selectedTool === "line" || selectedTool === "rect" || selectedTool === "ellipse")) {
+      const points = shapePoints(selectedTool, origin, point, event.shiftKey);
+      setDraft((old) => (old ? { ...old, points } : old));
+      return;
+    }
     setDraft((old) => old ? { ...old, points: [...old.points, point] } : old);
   };
 
   const endStroke = () => {
+    shapeOriginRef.current = null;
     if (!draft) return;
     if (mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] })) {
       historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
@@ -1005,6 +1049,10 @@ export default function Home() {
         case "s": case "S": event.preventDefault(); splitAtPlayhead(); break;
         case "b": case "B": setSelectedTool("pen"); break;
         case "e": case "E": setSelectedTool("eraser"); break;
+        case "l": case "L": setSelectedTool("line"); break;
+        case "r": case "R": setSelectedTool("rect"); break;
+        case "o": case "O": setSelectedTool("ellipse"); break;
+        case "g": case "G": setSelectedTool("lasso"); break;
         case "[": setBrushSize((size) => Math.max(1, size - 1)); break;
         case "]": setBrushSize((size) => Math.min(14, size + 1)); break;
         case "ArrowLeft": event.preventDefault(); seek(currentTime - step); break;
@@ -1255,6 +1303,11 @@ export default function Home() {
             <div className="tools">
               <button className={selectedTool === "pen" ? "selected" : ""} onClick={() => setSelectedTool("pen")} title="ペン (B)"><span className="pen-icon" /></button>
               <button className={selectedTool === "eraser" ? "selected" : ""} onClick={() => setSelectedTool("eraser")} title="消しゴム (E)"><span className="eraser-icon" /></button>
+              <span className="divider" />
+              {SHAPE_TOOLS.map(({ tool, label, hint }) => (
+                <button key={tool} className={`shape-tool ${selectedTool === tool ? "selected" : ""}`}
+                  onClick={() => setSelectedTool(tool)} title={hint}>{label}</button>
+              ))}
               <span className="divider" />
               {COLORS.map((swatch) => <button key={swatch} className={`swatch ${color === swatch ? "selected" : ""}`} style={{ "--swatch": swatch } as React.CSSProperties} onClick={() => { setColor(swatch); setSelectedTool("pen"); }} aria-label={`色 ${swatch}`} />)}
               <span className="divider" />

@@ -23,6 +23,47 @@ export function drawContainedImage(
   ctx.drawImage(image, left + (width - drawWidth) / 2, top + (height - drawHeight) / 2, drawWidth, drawHeight);
 }
 
+export type StrokeBox = { left: number; top: number; width: number; height: number };
+
+/**
+ * Paints a single stroke into a box. Every surface goes through here so the
+ * editor, the thumbnails and the exports cannot drift apart.
+ */
+export function paintStroke(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  stroke: Stroke,
+  box: StrokeBox,
+  minLineWidth = 1,
+) {
+  if (!stroke.points.length) return;
+  const at = (point: { x: number; y: number }) => ({
+    x: box.left + point.x * box.width,
+    y: box.top + point.y * box.height,
+  });
+  ctx.globalCompositeOperation = stroke.eraser ? "destination-out" : "source-over";
+  ctx.beginPath();
+  const first = at(stroke.points[0]);
+  ctx.moveTo(first.x, first.y);
+  stroke.points.slice(1).forEach((point) => {
+    const next = at(point);
+    ctx.lineTo(next.x, next.y);
+  });
+
+  if (stroke.fill) {
+    // A lasso region is closed for the user, however roughly it was drawn.
+    ctx.closePath();
+    ctx.fillStyle = stroke.color;
+    ctx.fill();
+  }
+  if (stroke.points.length === 1) ctx.lineTo(first.x + 0.1, first.y + 0.1);
+  ctx.strokeStyle = stroke.color;
+  ctx.lineWidth = Math.max(minLineWidth, stroke.size * (box.width / STROKE_REFERENCE_WIDTH));
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.stroke();
+  ctx.globalCompositeOperation = "source-over";
+}
+
 /** Paints one cut onto any 2D context. Used by the editor, the PNG sequence and the movie encoder. */
 export function paintStrokes(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
@@ -32,23 +73,7 @@ export function paintStrokes(
 ) {
   ctx.fillStyle = PAPER_COLOR;
   ctx.fillRect(0, 0, width, height);
-  const scale = width / STROKE_REFERENCE_WIDTH;
-
-  strokes.forEach((stroke) => {
-    if (!stroke.points.length) return;
-    ctx.globalCompositeOperation = stroke.eraser ? "destination-out" : "source-over";
-    ctx.strokeStyle = stroke.color;
-    ctx.lineWidth = Math.max(1, stroke.size * scale);
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    const first = stroke.points[0];
-    ctx.moveTo(first.x * width, first.y * height);
-    stroke.points.slice(1).forEach((point) => ctx.lineTo(point.x * width, point.y * height));
-    if (stroke.points.length === 1) ctx.lineTo(first.x * width + 0.1, first.y * height + 0.1);
-    ctx.stroke();
-  });
-  ctx.globalCompositeOperation = "source-over";
+  strokes.forEach((stroke) => paintStroke(ctx, stroke, { left: 0, top: 0, width, height }));
 }
 
 function loadImage(source: string) {
@@ -78,21 +103,7 @@ export async function renderCutToCanvas(
 
   // Eraser strokes may cut holes through the drawing and pasted image. A final
   // destination-over pass guarantees every exported pixel is opaque white.
-  const scale = width / STROKE_REFERENCE_WIDTH;
-  strokes.forEach((stroke) => {
-    if (!stroke.points.length) return;
-    ctx.globalCompositeOperation = stroke.eraser ? "destination-out" : "source-over";
-    ctx.strokeStyle = stroke.color;
-    ctx.lineWidth = Math.max(1, stroke.size * scale);
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    const first = stroke.points[0];
-    ctx.moveTo(first.x * width, first.y * height);
-    stroke.points.slice(1).forEach((point) => ctx.lineTo(point.x * width, point.y * height));
-    if (stroke.points.length === 1) ctx.lineTo(first.x * width + 0.1, first.y * height + 0.1);
-    ctx.stroke();
-  });
+  strokes.forEach((stroke) => paintStroke(ctx, stroke, { left: 0, top: 0, width, height }));
   ctx.globalCompositeOperation = "destination-over";
   ctx.fillStyle = EXPORT_PAPER_COLOR;
   ctx.fillRect(0, 0, width, height);
