@@ -28,6 +28,8 @@ type Peer = { id: string; socket: WebSocket };
 export class SignalRoom {
   private peers = new Map<string, Peer>();
   private hostId: string | null = null;
+  /** SHA-256 of the room passphrase, chosen by the host. Never the plain text. */
+  private passwordHash: string | null = null;
 
   fetch(request: Request): Response {
     if (request.headers.get("Upgrade") !== "websocket") {
@@ -40,21 +42,52 @@ export class SignalRoom {
 
     const id = crypto.randomUUID().slice(0, 8);
     const peer: Peer = { id, socket: server };
-    const isHost = this.hostId === null;
-    if (isHost) this.hostId = id;
-    this.peers.set(id, peer);
+    // The peer is not in the room until it has answered the gate: an
+    // unauthenticated socket must not be able to see or signal anyone.
+    let joined = false;
+    this.send(peer, { type: "gate", isFirst: this.hostId === null, needsPassword: this.passwordHash !== null });
 
-    this.send(peer, { type: "welcome", peerId: id, isHost, hostId: this.hostId });
-    if (!isHost && this.hostId) {
-      const host = this.peers.get(this.hostId);
-      if (host) this.send(host, { type: "peer-join", peerId: id });
-    }
+    const join = (hash: string | null) => {
+      const isHost = this.hostId === null;
+      if (isHost) {
+        this.hostId = id;
+        this.passwordHash = hash;
+      } else if (this.passwordHash && hash !== this.passwordHash) {
+        this.send(peer, { type: "denied" });
+        try { server.close(1008, "wrong password"); } catch { /* already closing */ }
+        return;
+      }
+      joined = true;
+      this.peers.set(id, peer);
+      this.send(peer, { type: "welcome", peerId: id, isHost, hostId: this.hostId });
+      if (!isHost && this.hostId) {
+        const host = this.peers.get(this.hostId);
+        if (host) this.send(host, { type: "peer-join", peerId: id });
+      }
+    };
 
     server.addEventListener("message", (event) => {
-      let message: { type?: string; to?: string; payload?: unknown };
+      let message: { type?: string; to?: string; payload?: unknown; hash?: string | null };
       try {
         message = JSON.parse(typeof event.data === "string" ? event.data : "");
       } catch {
+        return;
+      }
+      if (message.type === "auth") {
+        if (!joined) join(message.hash ?? null);
+        return;
+      }
+      if (!joined) return;
+      if (message.type === "set-password" && id === this.hostId) {
+        this.passwordHash = message.hash ?? null;
+        return;
+      }
+      if (message.type === "kick" && message.to && id === this.hostId) {
+        const evicted = this.peers.get(message.to);
+        if (!evicted) return;
+        this.send(evicted, { type: "kicked" });
+        try { evicted.socket.close(1000, "removed by host"); } catch { /* already closing */ }
+        this.drop(message.to);
         return;
       }
       if (message.type !== "signal" || !message.to) return;
@@ -74,6 +107,7 @@ export class SignalRoom {
     if (this.hostId === id) {
       // Host owned the only copy of the project, so the room ends with it.
       this.hostId = null;
+      this.passwordHash = null;
       this.peers.forEach((peer) => {
         this.send(peer, { type: "host-gone" });
         try { peer.socket.close(1000, "host left"); } catch { /* already closing */ }

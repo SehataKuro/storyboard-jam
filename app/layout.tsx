@@ -12,10 +12,10 @@ export async function generateMetadata(): Promise<Metadata> {
   const protocol = requestHeaders.get("x-forwarded-proto") || (host.startsWith("localhost") ? "http" : "https");
   const imageUrl = `${protocol}://${host}/og-conte.png`;
   return {
-    title: "CONTE LIVE — みんなで作る絵コンテ",
+    title: "STORYBOARD JAM — みんなで作る絵コンテ",
     description: "描く、聴く、合わせる。オンライン共同絵コンテ編集ツール。",
-    openGraph: { title: "CONTE LIVE", description: "描く、聴く、合わせる。", images: [{ url: imageUrl, width: 1734, height: 907 }] },
-    twitter: { card: "summary_large_image", title: "CONTE LIVE", description: "描く、聴く、合わせる。", images: [imageUrl] },
+    openGraph: { title: "STORYBOARD JAM", description: "描く、聴く、合わせる。", images: [{ url: imageUrl, width: 1734, height: 907 }] },
+    twitter: { card: "summary_large_image", title: "STORYBOARD JAM", description: "描く、聴く、合わせる。", images: [imageUrl] },
   };
 }
 

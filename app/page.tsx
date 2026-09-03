@@ -25,7 +25,7 @@ import {
   parseFrameDuration,
   snapToFrame,
 } from "./lib/types";
-import { Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
+import { Participant, Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
@@ -105,6 +105,12 @@ function shapePoints(tool: Tool, from: Point, to: Point, constrain: boolean): Po
   });
 }
 const LEGACY_STORAGE_KEY = "conte-live-project";
+const NAME_STORAGE_KEY = "conte-live-name";
+/** How many boards the undo stack keeps. */
+const HISTORY_LIMIT = 60;
+/** Shown for anyone who has not typed a name yet. */
+const guestLabel = (participant: Participant, index: number) =>
+  participant.name.trim() || (participant.isHost ? "ホスト" : `ゲスト${index}`);
 const roomStorageKey = (roomId: string) => `${LEGACY_STORAGE_KEY}:${roomId}`;
 
 const SHORTCUTS: [string, string][] = [
@@ -136,6 +142,8 @@ function frameBox(width: number, height: number, withMargin: boolean) {
 }
 
 const MAX_STAGE_WIDTH = 1120;
+/** Frame counts the timeline grid may step by, coarsest chosen that still fits. */
+const GRID_STEPS = [3, 6, 12, 24, 48, 120, 240, 720, 1440, 2880, 7200];
 const MIN_TIMELINE_ZOOM = 1;
 const MAX_TIMELINE_ZOOM = 40;
 const clamp = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
@@ -352,6 +360,8 @@ export default function Home() {
   const [audioName, setAudioName] = useState("");
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  /** Normalised peak per bucket of the loaded song, or null while there is none. */
+  const [waveform, setWaveform] = useState<number[] | null>(null);
   const [volume, setVolume] = useState(0.8);
   const [zoom, setZoom] = useState(1);
   const [panelOpen, setPanelOpen] = useState(true);
@@ -378,12 +388,22 @@ export default function Home() {
   const [stageDrag, setStageDrag] = useState<"pan" | "rotate" | null>(null);
   /** Laid-out width of the stage, used to size the brush ring. */
   const [canvasWidth, setCanvasWidth] = useState(0);
+  /** Visible width of the timeline, which decides how dense the grid can be. */
+  const [viewportWidth, setViewportWidth] = useState(0);
   /** Index of the cut card being dragged onto another to swap the drawings. */
   const [dragCutId, setDragCutId] = useState<string | null>(null);
   /** The lasso selection: its outline plus which strokes it caught. */
   const [selection, setSelection] = useState<{ polygon: Point[]; indexes: number[] } | null>(null);
   /** Live offset while the selection is being dragged to a new place. */
   const [selectionOffset, setSelectionOffset] = useState<Point | null>(null);
+  /** Everyone in the room, as published by the host. */
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [userName, setUserName] = useState("");
+  const [peopleOpen, setPeopleOpen] = useState(false);
+  /** True once the host has removed us, so reconnecting is not offered. */
+  const [evicted, setEvicted] = useState(false);
+  /** Whether this room asks newcomers for a passphrase. */
+  const [roomLocked, setRoomLocked] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -394,14 +414,20 @@ export default function Home() {
   const shapeOriginRef = useRef<Point | null>(null);
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
-  const historyRef = useRef<Record<string, CutContent[]>>({});
+  /**
+   * Undo used to be per cut and only covered drawing, so splitting or deleting
+   * a cut left nothing to go back to. Whole boards are kept instead; React
+   * shares the untouched cuts between snapshots, so this stays cheap.
+   */
+  const historyRef = useRef<{ project: Project; activeId: string }[]>([]);
   /** Cut content copied with Ctrl+C, pasted into another cut with Ctrl+Shift+V. */
   const cutClipboardRef = useRef<CutContent | null>(null);
   /** Strokes copied out of a lasso selection, pasted in place. */
   const strokeClipboardRef = useRef<Stroke[] | null>(null);
   /** Where a selection drag started, so the offset can be measured. */
   const selectionDragRef = useRef<Point | null>(null);
-  const redoRef = useRef<Record<string, CutContent[]>>({});
+  const redoRef = useRef<{ project: Project; activeId: string }[]>([]);
+  const activeIdRef = useRef("");
   const roomRef = useRef<Room | null>(null);
   const roomIdRef = useRef<string | null>(null);
   const projectRef = useRef<Project>(project);
@@ -423,6 +449,7 @@ export default function Home() {
   const exportName = projectName.trim() || "storyboard";
 
   useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { projectNameRef.current = projectName; }, [projectName]);
   useEffect(() => { setDurationInput(formatFrameDuration(activeDuration)); }, [activeDuration, activeId]);
   useEffect(() => { setSelection(null); setSelectionOffset(null); }, [activeId, selectedTool]);
@@ -440,6 +467,42 @@ export default function Home() {
     if (room.isHost()) room.broadcastSnapshot(next, projectNameRef.current);
     else room.sendOp(op);
     return true;
+  }, []);
+
+  const renameUser = useCallback((value: string) => {
+    setUserName(value);
+    try {
+      window.localStorage.setItem(NAME_STORAGE_KEY, value);
+    } catch { /* a missing name is not worth interrupting the session */ }
+    roomRef.current?.setName(value);
+  }, []);
+
+  /** Host only: protect the room, or clear the passphrase by leaving it empty. */
+  const changeRoomPassword = useCallback(async () => {
+    const room = roomRef.current;
+    if (!room?.isHost()) {
+      setToast("パスワードを設定できるのはホストだけです");
+      return;
+    }
+    const password = window.prompt("このルームのパスワード（空欄で解除）", "");
+    if (password === null) return;
+    await room.setPassword(password);
+    setToast(password ? "ルームにパスワードを設定しました" : "ルームのパスワードを解除しました");
+  }, []);
+
+  const kickParticipant = useCallback((participant: Participant, index: number) => {
+    if (!window.confirm(`${guestLabel(participant, index)} をルームから退出させますか？`)) return;
+    roomRef.current?.kick(participant.id);
+    setToast(`${guestLabel(participant, index)} を退出させました`);
+  }, []);
+
+  /** Call right before a change that should be undoable. */
+  const pushHistory = useCallback(() => {
+    historyRef.current = [
+      ...historyRef.current.slice(-(HISTORY_LIMIT - 1)),
+      { project: projectRef.current, activeId: activeIdRef.current },
+    ];
+    redoRef.current = [];
   }, []);
 
   const renameProject = useCallback((value: string) => {
@@ -513,6 +576,9 @@ export default function Home() {
       window.setTimeout(() => setCollabPulse(false), 900);
     };
 
+    const storedName = window.localStorage.getItem(NAME_STORAGE_KEY) || "";
+    setUserName(storedName);
+
     const room = new Room(roomId, {
       onRole: setRole,
       onStatus: setToast,
@@ -525,6 +591,13 @@ export default function Home() {
         setActiveId((current) => (incoming.project.cuts.some((cut) => cut.id === current) ? current : incoming.project.cuts[0]?.id || current));
         pulse();
       },
+      onRoster: setParticipants,
+      onEvicted: () => setEvicted(true),
+      onProtected: setRoomLocked,
+      requestPassword: async (retry) => window.prompt(
+        retry ? "パスワードが違います。もう一度入力してください" : "このルームはパスワードで保護されています",
+        "",
+      ),
       onOp: (op) => {
         if (op.type === "rename") {
           projectNameRef.current = op.value;
@@ -543,19 +616,20 @@ export default function Home() {
     });
     roomRef.current = room;
     room.connect();
+    room.setName(storedName);
     return () => { room.close(); roomRef.current = null; };
   }, []);
 
   useEffect(() => {
     const previousRole = previousRoleRef.current;
     previousRoleRef.current = role;
-    if (previousRole !== "guest" || role !== "closed") return;
+    if (previousRole !== "guest" || role !== "closed" || evicted) return;
 
     const shouldReload = window.confirm(
       "ホストとの接続が切断されました。再読み込みして再接続しますか？",
     );
     if (shouldReload) window.location.reload();
-  }, [role]);
+  }, [role, evicted]);
 
   /** What the stage shows: a selection being dragged moves before it is committed. */
   const displayStrokes = useMemo(() => {
@@ -804,9 +878,8 @@ export default function Home() {
       const moved = activeCut.strokes.map((stroke, index) => (selection.indexes.includes(index)
         ? translateStroke(stroke, offset.x, offset.y)
         : stroke));
+      pushHistory();
       if (mutate({ type: "strokes", cutId: activeId, strokes: moved })) {
-        historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
-        redoRef.current[activeId] = [];
         setSelection({
           polygon: selection.polygon.map((point) => ({ x: point.x + offset.x, y: point.y + offset.y })),
           indexes: selection.indexes,
@@ -835,43 +908,39 @@ export default function Home() {
       return;
     }
 
-    if (mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] })) {
-      historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
-      redoRef.current[activeId] = [];
-    }
+    pushHistory();
+    mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] });
     setDraft(null);
   };
 
-  const undo = useCallback(() => {
-    const cut = projectRef.current.cuts.find((c) => c.id === activeId);
-    const history = historyRef.current[activeId] || [];
-    if (!cut || !history.length) return;
-    if (mutate({ type: "content", cutId: activeId, ...history[history.length - 1] })) {
-      redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cutContent(cut)];
-      historyRef.current[activeId] = history.slice(0, -1);
+  /** Steps between two recorded boards, keeping the cut that was in view. */
+  const stepHistory = useCallback((from: typeof historyRef, to: typeof redoRef) => {
+    const entry = from.current[from.current.length - 1];
+    if (!entry) {
+      setToast(from === historyRef ? "これ以上戻せません" : "やり直す操作がありません");
+      return;
     }
-  }, [activeId, mutate]);
+    const current = { project: projectRef.current, activeId: activeIdRef.current };
+    if (!mutate({ type: "replace", project: entry.project })) return;
+    from.current = from.current.slice(0, -1);
+    to.current = [...to.current, current];
+    setSelection(null);
+    setDraft(null);
+    if (entry.project.cuts.some((cut) => cut.id === entry.activeId)) setActiveId(entry.activeId);
+  }, [mutate]);
 
-  const redo = useCallback(() => {
-    const cut = projectRef.current.cuts.find((c) => c.id === activeId);
-    const redoStack = redoRef.current[activeId] || [];
-    if (!cut || !redoStack.length) return;
-    if (mutate({ type: "content", cutId: activeId, ...redoStack[redoStack.length - 1] })) {
-      historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(cut)];
-      redoRef.current[activeId] = redoStack.slice(0, -1);
-    }
-  }, [activeId, mutate]);
+  const undo = useCallback(() => stepHistory(historyRef, redoRef), [stepHistory]);
+  const redo = useCallback(() => stepHistory(redoRef, historyRef), [stepHistory]);
 
   const pasteImageBlob = useCallback(async (blob: Blob) => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     if (!cut) return;
     const backgroundImage = await clipboardImageDataUrl(blob);
+    pushHistory();
     if (mutate({ type: "content", cutId: cut.id, strokes: cut.strokes, backgroundImage })) {
-      historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-      redoRef.current[cut.id] = [];
       setToast("クリップボードの画像を貼り付けました");
     }
-  }, [activeId, mutate]);
+  }, [activeId, mutate, pushHistory]);
 
   const pasteFromClipboard = useCallback(async () => {
     if (!navigator.clipboard?.read) {
@@ -912,13 +981,12 @@ export default function Home() {
       return;
     }
     if (!window.confirm("現在のカットの描画と貼り付け画像をすべて消去しますか？")) return;
+    pushHistory();
     if (mutate({ type: "content", cutId: cut.id, strokes: [] })) {
-      historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-      redoRef.current[cut.id] = [];
       setDraft(null);
       setToast("現在のカットを全消去しました（元に戻せます）");
     }
-  }, [activeId, mutate]);
+  }, [activeId, mutate, pushHistory]);
 
   /** Cuts are created by splitting the song at the playhead, never by appending a length. */
   const splitAtPlayhead = useCallback(() => {
@@ -932,11 +1000,12 @@ export default function Home() {
       return;
     }
     const id = newCutId();
+    pushHistory();
     if (mutate({ type: "split", at: currentTime, id })) {
       setActiveId(id);
       setToast(`${formatFramePosition(currentTime)} で分割しました`);
     }
-  }, [currentTime, mutate]);
+  }, [currentTime, mutate, pushHistory]);
 
   const deleteCut = useCallback(() => {
     if (projectRef.current.cuts.length <= 1) {
@@ -944,17 +1013,12 @@ export default function Home() {
       return;
     }
     const remaining = projectRef.current.cuts.filter((cut) => cut.id !== activeId);
+    pushHistory();
     if (mutate({ type: "delete", cutId: activeId })) {
       setActiveId(remaining[Math.max(0, Math.min(activeIndex, remaining.length - 1))].id);
       setToast("カットを削除しました");
     }
-  }, [activeId, activeIndex, mutate]);
-
-  /** Records the current content so the next content change can be undone. */
-  const rememberContent = (cut: Cut) => {
-    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-    redoRef.current[cut.id] = [];
-  };
+  }, [activeId, activeIndex, mutate, pushHistory]);
 
   /** Swaps two drawings without touching either cut's place on the song. */
   const swapCutContent = useCallback((aId: string, bId: string) => {
@@ -962,12 +1026,9 @@ export default function Home() {
     const a = current.cuts.find((cut) => cut.id === aId);
     const b = current.cuts.find((cut) => cut.id === bId);
     if (!a || !b || a === b) return;
-    if (mutate({ type: "swap", aId, bId })) {
-      rememberContent(a);
-      rememberContent(b);
-      setToast("カットの絵を入れ替えました");
-    }
-  }, [mutate]);
+    pushHistory();
+    if (mutate({ type: "swap", aId, bId })) setToast("カットの絵を入れ替えました");
+  }, [mutate, pushHistory]);
 
   const copyCutContent = useCallback(() => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
@@ -988,20 +1049,20 @@ export default function Home() {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     if (!cut || !selection) return;
     const strokes = cut.strokes.filter((_, index) => !selection.indexes.includes(index));
+    pushHistory();
     if (mutate({ type: "strokes", cutId: activeId, strokes })) {
-      rememberContent(cut);
       setSelection(null);
       setToast("選択範囲を削除しました");
     }
-  }, [activeId, mutate, selection]);
+  }, [activeId, mutate, pushHistory, selection]);
 
   const pasteCutContent = useCallback(() => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     const copiedStrokes = strokeClipboardRef.current;
     if (copiedStrokes?.length && cut) {
       // A copied selection lands on top of the cut, in the place it was cut from.
+      pushHistory();
       if (mutate({ type: "strokes", cutId: activeId, strokes: [...cut.strokes, ...copiedStrokes] })) {
-        rememberContent(cut);
         setToast(`選択範囲の${copiedStrokes.length}本を貼り付けました`);
       }
       return;
@@ -1011,11 +1072,9 @@ export default function Home() {
       setToast("コピーされたカットがありません");
       return;
     }
-    if (mutate({ type: "content", cutId: cut.id, ...copied })) {
-      rememberContent(cut);
-      setToast("カットの絵を貼り付けました");
-    }
-  }, [activeId, mutate]);
+    pushHistory();
+    if (mutate({ type: "content", cutId: cut.id, ...copied })) setToast("カットの絵を貼り付けました");
+  }, [activeId, mutate, pushHistory]);
 
   /** Duplicating splits the cut in half and fills the second half with a copy. */
   const duplicateCut = useCallback(() => {
@@ -1030,12 +1089,13 @@ export default function Home() {
       return;
     }
     const id = newCutId();
+    pushHistory();
     if (mutate({ type: "split", at, id, content: { ...cutContent(cut), title: cut.title, note: cut.note } })) {
       setActiveId(id);
       seek(at);
       setToast("カットを複製しました");
     }
-  }, [activeId, mutate, seek]);
+  }, [activeId, mutate, pushHistory, seek]);
 
   const updateActive = (patch: { title?: string; note?: string }) =>
     mutate({ type: "patch", cutId: activeId, patch });
@@ -1044,6 +1104,7 @@ export default function Home() {
   const updateActiveDuration = (seconds: number) => {
     const next = cuts[activeIndex + 1];
     if (!next) return;
+    pushHistory();
     mutate({ type: "move", cutId: next.id, start: activeCut.start + Math.max(MIN_CUT_DURATION, seconds) });
   };
 
@@ -1079,6 +1140,7 @@ export default function Home() {
     setAudioName(file.name.replace(/\.[^.]+$/, ""));
     setPlaying(false);
     seek(0);
+    void loadWaveform(file);
     // The song owns the total length, so adopt it as soon as the metadata arrives.
     const probe = new Audio(url);
     probe.onloadedmetadata = () => {
@@ -1087,6 +1149,41 @@ export default function Home() {
       setToast(`楽曲に合わせて全体を ${formatFramePosition(probe.duration)} にしました`);
     };
   };
+
+  /**
+   * Peak envelope of the song. Decoding happens once per file; the bars are
+   * the real signal rather than a decorative pattern.
+   */
+  const loadWaveform = useCallback(async (file: File) => {
+    setWaveform(null);
+    try {
+      const AudioContextClass = window.AudioContext
+        || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const context = new AudioContextClass();
+      const buffer = await context.decodeAudioData(await file.arrayBuffer());
+      await context.close();
+      const samples = buffer.getChannelData(0);
+      const buckets = 900;
+      const perBucket = Math.max(1, Math.floor(samples.length / buckets));
+      const peaks: number[] = [];
+      let loudest = 0;
+      for (let bucket = 0; bucket < buckets; bucket += 1) {
+        let peak = 0;
+        const start = bucket * perBucket;
+        for (let index = start; index < start + perBucket && index < samples.length; index += 1) {
+          const value = Math.abs(samples[index]);
+          if (value > peak) peak = value;
+        }
+        if (peak > loudest) loudest = peak;
+        peaks.push(peak);
+      }
+      setWaveform(loudest > 0 ? peaks.map((peak) => peak / loudest) : peaks);
+    } catch {
+      // A song we cannot decode still plays; it just gets no waveform.
+      setWaveform(null);
+    }
+  }, []);
 
   const exportFrame = async () => {
     try {
@@ -1113,8 +1210,8 @@ export default function Home() {
       if (!mutate({ type: "replace", project: bundle.project })) return;
       if (bundle.projectName) renameProject(bundle.projectName);
       setActiveId(bundle.project.cuts[0].id);
-      historyRef.current = {};
-      redoRef.current = {};
+      historyRef.current = [];
+      redoRef.current = [];
       seek(0);
       setToast(bundle.strokesRestored
         ? `${bundle.project.cuts.length}カットを読み込みました`
@@ -1295,6 +1392,7 @@ export default function Home() {
       setDrag((current) => (current ? { ...current, start } : current));
     };
     const onUp = () => {
+      pushHistory();
       if (mutate({ type: "move", cutId: drag.cutId, start: drag.start })) {
         setToast(`区切りを ${formatFramePosition(drag.start)} に移動しました`);
       }
@@ -1308,7 +1406,7 @@ export default function Home() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [drag, boundaryRange, mutate, timeAtClientX]);
+  }, [drag, boundaryRange, mutate, pushHistory, timeAtClientX]);
 
   /** Keyboard equivalent of dragging, so boundaries are reachable without a pointer. */
   const nudgeBoundary = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -1319,6 +1417,7 @@ export default function Home() {
     const { lower, upper } = boundaryRange(index);
     if (upper < lower) return;
     const cut = projectRef.current.cuts[index];
+    pushHistory();
     mutate({ type: "move", cutId: cut.id, start: Math.min(Math.max(cut.start + step, lower), upper) });
   };
 
@@ -1332,6 +1431,14 @@ export default function Home() {
     zoomAnchorRef.current = null;
     viewport.scrollLeft = anchor.ratio * viewport.scrollWidth - anchor.offset;
   }, [zoom]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const observer = new ResizeObserver(([entry]) => setViewportWidth(entry.contentRect.width));
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
 
   // Blender-style navigation: the wheel zooms, shift+wheel and the middle
   // button pan. Registered by hand because the wheel must be cancellable.
@@ -1394,15 +1501,40 @@ export default function Home() {
     return Math.max(4, size * (frameWidth / STROKE_REFERENCE_WIDTH) * view.scale);
   }, [brushSize, canvasWidth, selectedTool, view.scale]);
 
+  /**
+   * Grid lines sit on 3, 6 and 24 frame multiples — the counts animators work
+   * in — and the coarsest step that still leaves the lines readable wins.
+   */
   const rulerMarks = useMemo(() => {
-    const count = Math.min(21, 5 * Math.round(zoom));
-    return Array.from({ length: count }, (_, index) => index / (count - 1));
-  }, [zoom]);
+    const totalFrames = Math.max(1, Math.round(totalDuration * DEFAULT_FPS));
+    const width = Math.max(240, viewportWidth * zoom);
+    const step = GRID_STEPS.find((frames) => (frames / totalFrames) * width >= 9)
+      ?? GRID_STEPS[GRID_STEPS.length - 1];
+    // Never draw more lines than the ruler can show, however long the song is.
+    const count = Math.min(600, Math.floor(totalFrames / step));
+    return Array.from({ length: count + 1 }, (_, index) => {
+      const frame = index * step;
+      return {
+        frame,
+        ratio: frame / totalFrames,
+        // A second is the strong beat; 6 frames is the half-beat below it.
+        strength: frame % DEFAULT_FPS === 0 ? "second" : frame % 6 === 0 ? "half" : "frame",
+      };
+    });
+  }, [totalDuration, viewportWidth, zoom]);
+
+  /** Only the strong lines carry a timecode, and only when there is room. */
+  const rulerLabelStep = useMemo(() => {
+    const seconds = rulerMarks.filter((mark) => mark.strength === "second");
+    if (seconds.length < 2) return 1;
+    const gap = (seconds[1].ratio - seconds[0].ratio) * Math.max(240, viewportWidth * zoom);
+    return Math.max(1, Math.ceil(46 / Math.max(1, gap)));
+  }, [rulerMarks, viewportWidth, zoom]);
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark">C</span><span>CONTE</span><b>LIVE</b></div>
+        <div className="brand"><span className="brand-mark">S</span><span>STORYBOARD</span><b>JAM</b></div>
         <div className="project-title">
           <button className="crumb">Projects</button><span>/</span>
           <BufferedField aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName}
@@ -1415,27 +1547,59 @@ export default function Home() {
           }</span>
         </div>
         <div className="export-actions">
-          <button onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
-          <label className="import-action" title="書き出したZIPを読み込む">
-            ZIP読込<input type="file" accept=".zip,application/zip" onChange={(e) => importBundle(e, "zip")} />
-          </label>
-          <label className="import-action" title="解凍したフォルダを読み込む">
-            フォルダ読込
-            <input type="file" onChange={(e) => importBundle(e, "folder")} {...{ webkitdirectory: "", directory: "" }} />
-          </label>
-          <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
-          <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
+          <button className="help-action" onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
+          <div className="action-group" aria-label="読み込み">
+            <span className="group-label">読込</span>
+            <label className="import-action" title="書き出したZIPを読み込む">
+              ZIP<input type="file" accept=".zip,application/zip" onChange={(e) => importBundle(e, "zip")} />
+            </label>
+            <label className="import-action" title="解凍したフォルダを読み込む">
+              フォルダ
+              <input type="file" onChange={(e) => importBundle(e, "folder")} {...{ webkitdirectory: "", directory: "" }} />
+            </label>
+          </div>
+          <div className="action-group" aria-label="書き出し">
+            <span className="group-label">書出</span>
+            <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
+            <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
+          </div>
         </div>
         <div className="people" aria-label="参加中のメンバー">
           <span className="presence-text" title={ROLE_LABEL[role]}><i className={collabPulse ? "pulse" : ""} />{ROLE_LABEL[role]}</span>
-          <div className="avatars"><span className="av av1">YOU</span>{peers > 0 && <span className="av av2">+{peers}</span>}</div>
+          <BufferedField className="user-name" aria-label="あなたの名前" placeholder="あなたの名前"
+            value={userName} onCommit={renameUser} />
+          <button className="people-toggle" onClick={() => setPeopleOpen((open) => !open)}
+            aria-expanded={peopleOpen} title="参加者一覧">
+            参加者 {Math.max(1, participants.length || peers + 1)}
+          </button>
+          <button className={`room-lock ${roomLocked ? "locked" : ""}`} onClick={() => void changeRoomPassword()}
+            title={roomLocked ? "パスワードを変更・解除する" : "ルームにパスワードを設定する"}
+            disabled={role !== "host"}>{roomLocked ? "🔒" : "🔓"}</button>
           <button className="share" onClick={() => void shareRoom()}>招待する</button>
+          {peopleOpen && (
+            <div className="people-list" role="dialog" aria-label="参加者一覧">
+              <div className="people-head"><span>参加者</span><button onClick={() => setPeopleOpen(false)}>×</button></div>
+              <ul>
+                {(participants.length ? participants : [{ id: "self", name: userName, isHost: role === "host" }]).map((participant, index) => (
+                  <li key={participant.id}>
+                    <span className="av av1">{guestLabel(participant, index).slice(0, 2)}</span>
+                    <b>{guestLabel(participant, index)}</b>
+                    {participant.isHost && <small>ホスト</small>}
+                    {role === "host" && !participant.isHost && (
+                      <button className="kick" onClick={() => kickParticipant(participant, index)}>退出</button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {role !== "host" && <p className="field-hint">退出させられるのはホストだけです</p>}
+            </div>
+          )}
         </div>
       </header>
 
       <section className="workspace">
         <aside className="cuts-panel">
-          <div className="section-heading"><span>カット</span><button onClick={splitAtPlayhead} title="再生位置で分割 (S)" aria-label="再生位置で分割">✂</button></div>
+          <div className="section-heading"><span>カット</span></div>
           <div className={`cut-list ${dragCutId ? "swapping" : ""}`}>
             {cuts.map((cut, index) => (
               <button key={cut.id}
@@ -1460,7 +1624,6 @@ export default function Home() {
               </button>
             ))}
           </div>
-          <button className="add-cut" onClick={splitAtPlayhead}>✂ 再生位置で分割 <kbd>S</kbd></button>
         </aside>
 
         <section className="stage-area">
@@ -1554,6 +1717,7 @@ export default function Home() {
               </div>
               <input type="file" accept="audio/*" onChange={onAudio} />
             </label>
+            <button className="split-action" onClick={splitAtPlayhead} title="再生位置でカットを分割 (S)">✂ 分割</button>
             <label className="volume-control" title="音量">
               <span aria-hidden="true">🔈</span>
               <input type="range" min="0" max="100" value={Math.round(volume * 100)} aria-label="音量"
@@ -1576,7 +1740,14 @@ export default function Home() {
           <div className={`timeline-viewport ${panning ? "panning" : ""}`} ref={viewportRef}
             onPointerDown={beginTimelinePan} onAuxClick={(e) => e.preventDefault()}>
             <div className={`timeline ${scrubbing ? "scrubbing" : ""}`} ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
-              <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatFramePosition(v * totalDuration)}</span>)}</div>
+              <div className="ruler">
+                {rulerMarks.map((mark, index) => (
+                  <i key={mark.frame} className={`tick ${mark.strength}`} style={{ left: `${mark.ratio * 100}%` }}>
+                    {mark.strength === "second" && index % rulerLabelStep === 0
+                      && <span>{formatFramePosition(mark.frame / DEFAULT_FPS)}</span>}
+                  </i>
+                ))}
+              </div>
               <div className="video-track">
                 {cuts.map((cut, index) => (
                   <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""} ${index % 2 ? "odd" : ""}`}
@@ -1603,7 +1774,11 @@ export default function Home() {
                   </button>
                 );
               })}
-              <div className="audio-track"><div className="waveform">{Array.from({ length: 90 }, (_, i) => <i key={i} style={{ height: `${20 + ((i * 37) % 65)}%` }} />)}</div></div>
+              <div className="audio-track">
+                {waveform
+                  ? <div className="waveform">{waveform.map((peak, index) => <i key={index} style={{ height: `${Math.max(2, peak * 100)}%` }} />)}</div>
+                  : <div className="waveform empty" />}
+              </div>
               <div className="playhead" style={{ left: `${(currentTime / totalDuration) * 100}%` }}><i /></div>
             </div>
           </div>

@@ -9,7 +9,7 @@ export type Bundle = { project: Project; projectName: string; strokesRestored: b
 
 /** The complete, re-importable state. Images in the bundle are for other tools, not for us. */
 export function buildProjectFile(project: Project, projectName: string) {
-  return JSON.stringify({ format: "conte-live/project", version: 1, projectName, project }, null, 2);
+  return JSON.stringify({ format: "storyboard-jam/project", version: 1, projectName, project }, null, 2);
 }
 
 function parseProjectFile(text: string): Bundle | null {
