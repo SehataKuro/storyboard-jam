@@ -394,6 +394,8 @@ export default function Home() {
   const [peopleOpen, setPeopleOpen] = useState(false);
   /** True once the host has removed us, so reconnecting is not offered. */
   const [evicted, setEvicted] = useState(false);
+  /** Whether this room asks newcomers for a passphrase. */
+  const [roomLocked, setRoomLocked] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -458,6 +460,19 @@ export default function Home() {
       window.localStorage.setItem(NAME_STORAGE_KEY, value);
     } catch { /* a missing name is not worth interrupting the session */ }
     roomRef.current?.setName(value);
+  }, []);
+
+  /** Host only: protect the room, or clear the passphrase by leaving it empty. */
+  const changeRoomPassword = useCallback(async () => {
+    const room = roomRef.current;
+    if (!room?.isHost()) {
+      setToast("パスワードを設定できるのはホストだけです");
+      return;
+    }
+    const password = window.prompt("このルームのパスワード（空欄で解除）", "");
+    if (password === null) return;
+    await room.setPassword(password);
+    setToast(password ? "ルームにパスワードを設定しました" : "ルームのパスワードを解除しました");
   }, []);
 
   const kickParticipant = useCallback((participant: Participant, index: number) => {
@@ -554,6 +569,11 @@ export default function Home() {
       },
       onRoster: setParticipants,
       onEvicted: () => setEvicted(true),
+      onProtected: setRoomLocked,
+      requestPassword: async (retry) => window.prompt(
+        retry ? "パスワードが違います。もう一度入力してください" : "このルームはパスワードで保護されています",
+        "",
+      ),
       onOp: (op) => {
         if (op.type === "rename") {
           projectNameRef.current = op.value;
@@ -1464,6 +1484,9 @@ export default function Home() {
             aria-expanded={peopleOpen} title="参加者一覧">
             参加者 {Math.max(1, participants.length || peers + 1)}
           </button>
+          <button className={`room-lock ${roomLocked ? "locked" : ""}`} onClick={() => void changeRoomPassword()}
+            title={roomLocked ? "パスワードを変更・解除する" : "ルームにパスワードを設定する"}
+            disabled={role !== "host"}>{roomLocked ? "🔒" : "🔓"}</button>
           <button className="share" onClick={() => void shareRoom()}>招待する</button>
           {peopleOpen && (
             <div className="people-list" role="dialog" aria-label="参加者一覧">

@@ -34,8 +34,18 @@ export type RoomHandlers = {
   onRoster: (participants: Participant[]) => void;
   /** The host removed us from the room, so there is nothing to reconnect to. */
   onEvicted: () => void;
+  /** Asked for the room passphrase when joining a protected room. */
+  requestPassword: (retry: boolean) => Promise<string | null>;
+  /** The room's protection state changed, so the header can show a lock. */
+  onProtected: (locked: boolean) => void;
   getSnapshot: () => RoomSnapshot;
 };
+
+/** The passphrase never leaves the browser: only its digest is sent. */
+export async function hashPassword(password: string) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] },
@@ -58,6 +68,9 @@ export class Room {
   /** Host only: the display name each guest sent over its data channel. */
   private names = new Map<string, string>();
   private evicted = false;
+  /** Digest of the passphrase this tab is holding, host or guest. */
+  private passwordHash: string | null = null;
+  private wrongPassword = false;
 
   constructor(private room: string, private handlers: RoomHandlers) {}
 
@@ -70,7 +83,7 @@ export class Room {
     socket.onmessage = (event) => void this.onSignalMessage(JSON.parse(event.data as string));
     socket.onerror = () => this.handlers.onStatus("シグナリングに接続できません");
     socket.onclose = () => {
-      if (this.closedByUs || this.evicted) return;
+      if (this.closedByUs || this.evicted || this.wrongPassword) return;
       const wasHost = this.role === "host";
       this.setRole("closed");
       this.handlers.onStatus(wasHost ? "ルームを終了しました" : "ホストが退出したため切断しました");
@@ -99,6 +112,17 @@ export class Room {
     }
     const link = this.hostId ? this.links.get(this.hostId) : null;
     if (link?.channel?.readyState === "open") link.channel.send(JSON.stringify({ type: "hello", name }));
+  }
+
+  /**
+   * Host only: set or clear the room passphrase. Guests joining from now on
+   * have to know it; everyone already inside stays.
+   */
+  async setPassword(password: string) {
+    if (this.role !== "host") return;
+    this.passwordHash = password ? await hashPassword(password) : null;
+    this.socket?.send(JSON.stringify({ type: "set-password", hash: this.passwordHash }));
+    this.handlers.onProtected(this.passwordHash !== null);
   }
 
   /** Host only: remove a guest from the room. */
@@ -163,12 +187,41 @@ export class Room {
     peerId?: string;
     isHost?: boolean;
     hostId?: string;
+    needsPassword?: boolean;
+    isFirst?: boolean;
     from?: string;
     payload?: { sdp?: RTCSessionDescriptionInit; ice?: RTCIceCandidateInit };
   }) {
+    if (message.type === "gate") {
+      // A protected room asks before it lets anyone see who else is inside.
+      if (message.needsPassword) {
+        const password = await this.handlers.requestPassword(this.wrongPassword);
+        if (password === null) {
+          this.closedByUs = true;
+          this.setRole("closed");
+          this.handlers.onStatus("パスワードの入力を中止しました");
+          this.socket?.close();
+          return;
+        }
+        this.passwordHash = await hashPassword(password);
+      }
+      this.handlers.onProtected(Boolean(message.needsPassword));
+      this.socket?.send(JSON.stringify({ type: "auth", hash: this.passwordHash }));
+      return;
+    }
+
+    if (message.type === "denied") {
+      // Reconnect and ask again: the socket is closed by the room.
+      this.wrongPassword = true;
+      this.handlers.onStatus("パスワードが違います");
+      window.setTimeout(() => { if (!this.closedByUs) this.connect(); }, 400);
+      return;
+    }
+
     if (message.type === "welcome") {
       this.hostId = message.hostId || null;
       this.selfId = message.peerId || null;
+      this.wrongPassword = false;
       this.setRole(message.isHost ? "host" : "guest");
       this.handlers.onStatus(message.isHost ? "ホストとしてルームを開きました" : "ホストへ接続中…");
       if (message.isHost) this.publishRoster();
