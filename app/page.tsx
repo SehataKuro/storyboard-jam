@@ -142,6 +142,8 @@ function frameBox(width: number, height: number, withMargin: boolean) {
 }
 
 const MAX_STAGE_WIDTH = 1120;
+/** Frame counts the timeline grid may step by, coarsest chosen that still fits. */
+const GRID_STEPS = [3, 6, 12, 24, 48, 120, 240, 720, 1440, 2880, 7200];
 const MIN_TIMELINE_ZOOM = 1;
 const MAX_TIMELINE_ZOOM = 40;
 const clamp = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
@@ -358,6 +360,8 @@ export default function Home() {
   const [audioName, setAudioName] = useState("");
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  /** Normalised peak per bucket of the loaded song, or null while there is none. */
+  const [waveform, setWaveform] = useState<number[] | null>(null);
   const [volume, setVolume] = useState(0.8);
   const [zoom, setZoom] = useState(1);
   const [panelOpen, setPanelOpen] = useState(true);
@@ -384,6 +388,8 @@ export default function Home() {
   const [stageDrag, setStageDrag] = useState<"pan" | "rotate" | null>(null);
   /** Laid-out width of the stage, used to size the brush ring. */
   const [canvasWidth, setCanvasWidth] = useState(0);
+  /** Visible width of the timeline, which decides how dense the grid can be. */
+  const [viewportWidth, setViewportWidth] = useState(0);
   /** Index of the cut card being dragged onto another to swap the drawings. */
   const [dragCutId, setDragCutId] = useState<string | null>(null);
   /** The lasso selection: its outline plus which strokes it caught. */
@@ -1134,6 +1140,7 @@ export default function Home() {
     setAudioName(file.name.replace(/\.[^.]+$/, ""));
     setPlaying(false);
     seek(0);
+    void loadWaveform(file);
     // The song owns the total length, so adopt it as soon as the metadata arrives.
     const probe = new Audio(url);
     probe.onloadedmetadata = () => {
@@ -1142,6 +1149,41 @@ export default function Home() {
       setToast(`楽曲に合わせて全体を ${formatFramePosition(probe.duration)} にしました`);
     };
   };
+
+  /**
+   * Peak envelope of the song. Decoding happens once per file; the bars are
+   * the real signal rather than a decorative pattern.
+   */
+  const loadWaveform = useCallback(async (file: File) => {
+    setWaveform(null);
+    try {
+      const AudioContextClass = window.AudioContext
+        || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const context = new AudioContextClass();
+      const buffer = await context.decodeAudioData(await file.arrayBuffer());
+      await context.close();
+      const samples = buffer.getChannelData(0);
+      const buckets = 900;
+      const perBucket = Math.max(1, Math.floor(samples.length / buckets));
+      const peaks: number[] = [];
+      let loudest = 0;
+      for (let bucket = 0; bucket < buckets; bucket += 1) {
+        let peak = 0;
+        const start = bucket * perBucket;
+        for (let index = start; index < start + perBucket && index < samples.length; index += 1) {
+          const value = Math.abs(samples[index]);
+          if (value > peak) peak = value;
+        }
+        if (peak > loudest) loudest = peak;
+        peaks.push(peak);
+      }
+      setWaveform(loudest > 0 ? peaks.map((peak) => peak / loudest) : peaks);
+    } catch {
+      // A song we cannot decode still plays; it just gets no waveform.
+      setWaveform(null);
+    }
+  }, []);
 
   const exportFrame = async () => {
     try {
@@ -1390,6 +1432,14 @@ export default function Home() {
     viewport.scrollLeft = anchor.ratio * viewport.scrollWidth - anchor.offset;
   }, [zoom]);
 
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const observer = new ResizeObserver(([entry]) => setViewportWidth(entry.contentRect.width));
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
+
   // Blender-style navigation: the wheel zooms, shift+wheel and the middle
   // button pan. Registered by hand because the wheel must be cancellable.
   useEffect(() => {
@@ -1451,10 +1501,35 @@ export default function Home() {
     return Math.max(4, size * (frameWidth / STROKE_REFERENCE_WIDTH) * view.scale);
   }, [brushSize, canvasWidth, selectedTool, view.scale]);
 
+  /**
+   * Grid lines sit on 3, 6 and 24 frame multiples — the counts animators work
+   * in — and the coarsest step that still leaves the lines readable wins.
+   */
   const rulerMarks = useMemo(() => {
-    const count = Math.min(21, 5 * Math.round(zoom));
-    return Array.from({ length: count }, (_, index) => index / (count - 1));
-  }, [zoom]);
+    const totalFrames = Math.max(1, Math.round(totalDuration * DEFAULT_FPS));
+    const width = Math.max(240, viewportWidth * zoom);
+    const step = GRID_STEPS.find((frames) => (frames / totalFrames) * width >= 9)
+      ?? GRID_STEPS[GRID_STEPS.length - 1];
+    // Never draw more lines than the ruler can show, however long the song is.
+    const count = Math.min(600, Math.floor(totalFrames / step));
+    return Array.from({ length: count + 1 }, (_, index) => {
+      const frame = index * step;
+      return {
+        frame,
+        ratio: frame / totalFrames,
+        // A second is the strong beat; 6 frames is the half-beat below it.
+        strength: frame % DEFAULT_FPS === 0 ? "second" : frame % 6 === 0 ? "half" : "frame",
+      };
+    });
+  }, [totalDuration, viewportWidth, zoom]);
+
+  /** Only the strong lines carry a timecode, and only when there is room. */
+  const rulerLabelStep = useMemo(() => {
+    const seconds = rulerMarks.filter((mark) => mark.strength === "second");
+    if (seconds.length < 2) return 1;
+    const gap = (seconds[1].ratio - seconds[0].ratio) * Math.max(240, viewportWidth * zoom);
+    return Math.max(1, Math.ceil(46 / Math.max(1, gap)));
+  }, [rulerMarks, viewportWidth, zoom]);
 
   return (
     <main className="app-shell">
@@ -1472,16 +1547,22 @@ export default function Home() {
           }</span>
         </div>
         <div className="export-actions">
-          <button onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
-          <label className="import-action" title="書き出したZIPを読み込む">
-            ZIP読込<input type="file" accept=".zip,application/zip" onChange={(e) => importBundle(e, "zip")} />
-          </label>
-          <label className="import-action" title="解凍したフォルダを読み込む">
-            フォルダ読込
-            <input type="file" onChange={(e) => importBundle(e, "folder")} {...{ webkitdirectory: "", directory: "" }} />
-          </label>
-          <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
-          <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
+          <button className="help-action" onClick={() => setHelpOpen(true)} title="ショートカット一覧 (?)">?</button>
+          <div className="action-group" aria-label="読み込み">
+            <span className="group-label">読込</span>
+            <label className="import-action" title="書き出したZIPを読み込む">
+              ZIP<input type="file" accept=".zip,application/zip" onChange={(e) => importBundle(e, "zip")} />
+            </label>
+            <label className="import-action" title="解凍したフォルダを読み込む">
+              フォルダ
+              <input type="file" onChange={(e) => importBundle(e, "folder")} {...{ webkitdirectory: "", directory: "" }} />
+            </label>
+          </div>
+          <div className="action-group" aria-label="書き出し">
+            <span className="group-label">書出</span>
+            <button onClick={exportSequence} disabled={Boolean(busy)}>連番＋AE</button>
+            <button onClick={exportMp4} disabled={Boolean(busy)}>MP4</button>
+          </div>
         </div>
         <div className="people" aria-label="参加中のメンバー">
           <span className="presence-text" title={ROLE_LABEL[role]}><i className={collabPulse ? "pulse" : ""} />{ROLE_LABEL[role]}</span>
@@ -1518,7 +1599,7 @@ export default function Home() {
 
       <section className="workspace">
         <aside className="cuts-panel">
-          <div className="section-heading"><span>カット</span><button onClick={splitAtPlayhead} title="再生位置で分割 (S)" aria-label="再生位置で分割">✂</button></div>
+          <div className="section-heading"><span>カット</span></div>
           <div className={`cut-list ${dragCutId ? "swapping" : ""}`}>
             {cuts.map((cut, index) => (
               <button key={cut.id}
@@ -1543,7 +1624,6 @@ export default function Home() {
               </button>
             ))}
           </div>
-          <button className="add-cut" onClick={splitAtPlayhead}>✂ 再生位置で分割 <kbd>S</kbd></button>
         </aside>
 
         <section className="stage-area">
@@ -1637,6 +1717,7 @@ export default function Home() {
               </div>
               <input type="file" accept="audio/*" onChange={onAudio} />
             </label>
+            <button className="split-action" onClick={splitAtPlayhead} title="再生位置でカットを分割 (S)">✂ 分割</button>
             <label className="volume-control" title="音量">
               <span aria-hidden="true">🔈</span>
               <input type="range" min="0" max="100" value={Math.round(volume * 100)} aria-label="音量"
@@ -1659,7 +1740,14 @@ export default function Home() {
           <div className={`timeline-viewport ${panning ? "panning" : ""}`} ref={viewportRef}
             onPointerDown={beginTimelinePan} onAuxClick={(e) => e.preventDefault()}>
             <div className={`timeline ${scrubbing ? "scrubbing" : ""}`} ref={timelineRef} style={{ width: `${zoom * 100}%` }} onPointerDown={onTimelinePointer}>
-              <div className="ruler">{rulerMarks.map((v) => <span key={v} style={{ left: `${v * 100}%` }}>{formatFramePosition(v * totalDuration)}</span>)}</div>
+              <div className="ruler">
+                {rulerMarks.map((mark, index) => (
+                  <i key={mark.frame} className={`tick ${mark.strength}`} style={{ left: `${mark.ratio * 100}%` }}>
+                    {mark.strength === "second" && index % rulerLabelStep === 0
+                      && <span>{formatFramePosition(mark.frame / DEFAULT_FPS)}</span>}
+                  </i>
+                ))}
+              </div>
               <div className="video-track">
                 {cuts.map((cut, index) => (
                   <button key={cut.id} className={`timeline-cut ${cut.id === activeId ? "active" : ""} ${index % 2 ? "odd" : ""}`}
@@ -1686,7 +1774,11 @@ export default function Home() {
                   </button>
                 );
               })}
-              <div className="audio-track"><div className="waveform">{Array.from({ length: 90 }, (_, i) => <i key={i} style={{ height: `${20 + ((i * 37) % 65)}%` }} />)}</div></div>
+              <div className="audio-track">
+                {waveform
+                  ? <div className="waveform">{waveform.map((peak, index) => <i key={index} style={{ height: `${Math.max(2, peak * 100)}%` }} />)}</div>
+                  : <div className="waveform empty" />}
+              </div>
               <div className="playhead" style={{ left: `${(currentTime / totalDuration) * 100}%` }}><i /></div>
             </div>
           </div>
