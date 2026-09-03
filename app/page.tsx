@@ -1327,14 +1327,20 @@ export default function Home() {
             <span className="timecode">{formatFramePosition(currentTime)} <small>/ {formatFramePosition(totalDuration)}</small></span>
           </div>
           <div className="audio-info">
-            <span className="wave-icon">≋</span>
-            <div><strong>{audioName || "音源なし"}</strong><small>{audioUrl ? "この端末だけで再生" : "楽曲を読み込むと全体の尺が決まります"}</small></div>
+            {/* The song name is the picker: clicking it opens the file dialog. */}
+            <label className="audio-picker" title="クリックして音源を選択">
+              <span className="wave-icon">≋</span>
+              <div>
+                <strong>{audioName || "音源なし"}</strong>
+                <small>{audioUrl ? "クリックで音源を変更" : "クリックで音源を選択（全体の尺が決まります）"}</small>
+              </div>
+              <input type="file" accept="audio/*" onChange={onAudio} />
+            </label>
             <label className="volume-control" title="音量">
               <span aria-hidden="true">🔈</span>
               <input type="range" min="0" max="100" value={Math.round(volume * 100)} aria-label="音量"
                 onChange={(e) => setVolume(Number(e.target.value) / 100)} />
             </label>
-            <label className="audio-upload">音源を変更<input type="file" accept="audio/*" onChange={onAudio} /></label>
             {/* Playback engine for the timeline, not user-facing media, so there is nothing to caption. */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             {audioUrl && <audio ref={audioRef} src={audioUrl} onEnded={() => setPlaying(false)} />}
