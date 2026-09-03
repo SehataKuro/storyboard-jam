@@ -106,6 +106,8 @@ function shapePoints(tool: Tool, from: Point, to: Point, constrain: boolean): Po
 }
 const LEGACY_STORAGE_KEY = "conte-live-project";
 const NAME_STORAGE_KEY = "conte-live-name";
+/** How many boards the undo stack keeps. */
+const HISTORY_LIMIT = 60;
 /** Shown for anyone who has not typed a name yet. */
 const guestLabel = (participant: Participant, index: number) =>
   participant.name.trim() || (participant.isHost ? "ホスト" : `ゲスト${index}`);
@@ -406,14 +408,20 @@ export default function Home() {
   const shapeOriginRef = useRef<Point | null>(null);
   const animationRef = useRef<number | null>(null);
   const playStartRef = useRef({ at: 0, time: 0 });
-  const historyRef = useRef<Record<string, CutContent[]>>({});
+  /**
+   * Undo used to be per cut and only covered drawing, so splitting or deleting
+   * a cut left nothing to go back to. Whole boards are kept instead; React
+   * shares the untouched cuts between snapshots, so this stays cheap.
+   */
+  const historyRef = useRef<{ project: Project; activeId: string }[]>([]);
   /** Cut content copied with Ctrl+C, pasted into another cut with Ctrl+Shift+V. */
   const cutClipboardRef = useRef<CutContent | null>(null);
   /** Strokes copied out of a lasso selection, pasted in place. */
   const strokeClipboardRef = useRef<Stroke[] | null>(null);
   /** Where a selection drag started, so the offset can be measured. */
   const selectionDragRef = useRef<Point | null>(null);
-  const redoRef = useRef<Record<string, CutContent[]>>({});
+  const redoRef = useRef<{ project: Project; activeId: string }[]>([]);
+  const activeIdRef = useRef("");
   const roomRef = useRef<Room | null>(null);
   const roomIdRef = useRef<string | null>(null);
   const projectRef = useRef<Project>(project);
@@ -435,6 +443,7 @@ export default function Home() {
   const exportName = projectName.trim() || "storyboard";
 
   useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { projectNameRef.current = projectName; }, [projectName]);
   useEffect(() => { setDurationInput(formatFrameDuration(activeDuration)); }, [activeDuration, activeId]);
   useEffect(() => { setSelection(null); setSelectionOffset(null); }, [activeId, selectedTool]);
@@ -479,6 +488,15 @@ export default function Home() {
     if (!window.confirm(`${guestLabel(participant, index)} をルームから退出させますか？`)) return;
     roomRef.current?.kick(participant.id);
     setToast(`${guestLabel(participant, index)} を退出させました`);
+  }, []);
+
+  /** Call right before a change that should be undoable. */
+  const pushHistory = useCallback(() => {
+    historyRef.current = [
+      ...historyRef.current.slice(-(HISTORY_LIMIT - 1)),
+      { project: projectRef.current, activeId: activeIdRef.current },
+    ];
+    redoRef.current = [];
   }, []);
 
   const renameProject = useCallback((value: string) => {
@@ -854,9 +872,8 @@ export default function Home() {
       const moved = activeCut.strokes.map((stroke, index) => (selection.indexes.includes(index)
         ? translateStroke(stroke, offset.x, offset.y)
         : stroke));
+      pushHistory();
       if (mutate({ type: "strokes", cutId: activeId, strokes: moved })) {
-        historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
-        redoRef.current[activeId] = [];
         setSelection({
           polygon: selection.polygon.map((point) => ({ x: point.x + offset.x, y: point.y + offset.y })),
           indexes: selection.indexes,
@@ -885,43 +902,39 @@ export default function Home() {
       return;
     }
 
-    if (mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] })) {
-      historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(activeCut)];
-      redoRef.current[activeId] = [];
-    }
+    pushHistory();
+    mutate({ type: "strokes", cutId: activeId, strokes: [...activeCut.strokes, draft] });
     setDraft(null);
   };
 
-  const undo = useCallback(() => {
-    const cut = projectRef.current.cuts.find((c) => c.id === activeId);
-    const history = historyRef.current[activeId] || [];
-    if (!cut || !history.length) return;
-    if (mutate({ type: "content", cutId: activeId, ...history[history.length - 1] })) {
-      redoRef.current[activeId] = [...(redoRef.current[activeId] || []), cutContent(cut)];
-      historyRef.current[activeId] = history.slice(0, -1);
+  /** Steps between two recorded boards, keeping the cut that was in view. */
+  const stepHistory = useCallback((from: typeof historyRef, to: typeof redoRef) => {
+    const entry = from.current[from.current.length - 1];
+    if (!entry) {
+      setToast(from === historyRef ? "これ以上戻せません" : "やり直す操作がありません");
+      return;
     }
-  }, [activeId, mutate]);
+    const current = { project: projectRef.current, activeId: activeIdRef.current };
+    if (!mutate({ type: "replace", project: entry.project })) return;
+    from.current = from.current.slice(0, -1);
+    to.current = [...to.current, current];
+    setSelection(null);
+    setDraft(null);
+    if (entry.project.cuts.some((cut) => cut.id === entry.activeId)) setActiveId(entry.activeId);
+  }, [mutate]);
 
-  const redo = useCallback(() => {
-    const cut = projectRef.current.cuts.find((c) => c.id === activeId);
-    const redoStack = redoRef.current[activeId] || [];
-    if (!cut || !redoStack.length) return;
-    if (mutate({ type: "content", cutId: activeId, ...redoStack[redoStack.length - 1] })) {
-      historyRef.current[activeId] = [...(historyRef.current[activeId] || []), cutContent(cut)];
-      redoRef.current[activeId] = redoStack.slice(0, -1);
-    }
-  }, [activeId, mutate]);
+  const undo = useCallback(() => stepHistory(historyRef, redoRef), [stepHistory]);
+  const redo = useCallback(() => stepHistory(redoRef, historyRef), [stepHistory]);
 
   const pasteImageBlob = useCallback(async (blob: Blob) => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     if (!cut) return;
     const backgroundImage = await clipboardImageDataUrl(blob);
+    pushHistory();
     if (mutate({ type: "content", cutId: cut.id, strokes: cut.strokes, backgroundImage })) {
-      historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-      redoRef.current[cut.id] = [];
       setToast("クリップボードの画像を貼り付けました");
     }
-  }, [activeId, mutate]);
+  }, [activeId, mutate, pushHistory]);
 
   const pasteFromClipboard = useCallback(async () => {
     if (!navigator.clipboard?.read) {
@@ -962,13 +975,12 @@ export default function Home() {
       return;
     }
     if (!window.confirm("現在のカットの描画と貼り付け画像をすべて消去しますか？")) return;
+    pushHistory();
     if (mutate({ type: "content", cutId: cut.id, strokes: [] })) {
-      historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-      redoRef.current[cut.id] = [];
       setDraft(null);
       setToast("現在のカットを全消去しました（元に戻せます）");
     }
-  }, [activeId, mutate]);
+  }, [activeId, mutate, pushHistory]);
 
   /** Cuts are created by splitting the song at the playhead, never by appending a length. */
   const splitAtPlayhead = useCallback(() => {
@@ -982,11 +994,12 @@ export default function Home() {
       return;
     }
     const id = newCutId();
+    pushHistory();
     if (mutate({ type: "split", at: currentTime, id })) {
       setActiveId(id);
       setToast(`${formatFramePosition(currentTime)} で分割しました`);
     }
-  }, [currentTime, mutate]);
+  }, [currentTime, mutate, pushHistory]);
 
   const deleteCut = useCallback(() => {
     if (projectRef.current.cuts.length <= 1) {
@@ -994,17 +1007,12 @@ export default function Home() {
       return;
     }
     const remaining = projectRef.current.cuts.filter((cut) => cut.id !== activeId);
+    pushHistory();
     if (mutate({ type: "delete", cutId: activeId })) {
       setActiveId(remaining[Math.max(0, Math.min(activeIndex, remaining.length - 1))].id);
       setToast("カットを削除しました");
     }
-  }, [activeId, activeIndex, mutate]);
-
-  /** Records the current content so the next content change can be undone. */
-  const rememberContent = (cut: Cut) => {
-    historyRef.current[cut.id] = [...(historyRef.current[cut.id] || []), cutContent(cut)];
-    redoRef.current[cut.id] = [];
-  };
+  }, [activeId, activeIndex, mutate, pushHistory]);
 
   /** Swaps two drawings without touching either cut's place on the song. */
   const swapCutContent = useCallback((aId: string, bId: string) => {
@@ -1012,12 +1020,9 @@ export default function Home() {
     const a = current.cuts.find((cut) => cut.id === aId);
     const b = current.cuts.find((cut) => cut.id === bId);
     if (!a || !b || a === b) return;
-    if (mutate({ type: "swap", aId, bId })) {
-      rememberContent(a);
-      rememberContent(b);
-      setToast("カットの絵を入れ替えました");
-    }
-  }, [mutate]);
+    pushHistory();
+    if (mutate({ type: "swap", aId, bId })) setToast("カットの絵を入れ替えました");
+  }, [mutate, pushHistory]);
 
   const copyCutContent = useCallback(() => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
@@ -1038,20 +1043,20 @@ export default function Home() {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     if (!cut || !selection) return;
     const strokes = cut.strokes.filter((_, index) => !selection.indexes.includes(index));
+    pushHistory();
     if (mutate({ type: "strokes", cutId: activeId, strokes })) {
-      rememberContent(cut);
       setSelection(null);
       setToast("選択範囲を削除しました");
     }
-  }, [activeId, mutate, selection]);
+  }, [activeId, mutate, pushHistory, selection]);
 
   const pasteCutContent = useCallback(() => {
     const cut = projectRef.current.cuts.find((item) => item.id === activeId);
     const copiedStrokes = strokeClipboardRef.current;
     if (copiedStrokes?.length && cut) {
       // A copied selection lands on top of the cut, in the place it was cut from.
+      pushHistory();
       if (mutate({ type: "strokes", cutId: activeId, strokes: [...cut.strokes, ...copiedStrokes] })) {
-        rememberContent(cut);
         setToast(`選択範囲の${copiedStrokes.length}本を貼り付けました`);
       }
       return;
@@ -1061,11 +1066,9 @@ export default function Home() {
       setToast("コピーされたカットがありません");
       return;
     }
-    if (mutate({ type: "content", cutId: cut.id, ...copied })) {
-      rememberContent(cut);
-      setToast("カットの絵を貼り付けました");
-    }
-  }, [activeId, mutate]);
+    pushHistory();
+    if (mutate({ type: "content", cutId: cut.id, ...copied })) setToast("カットの絵を貼り付けました");
+  }, [activeId, mutate, pushHistory]);
 
   /** Duplicating splits the cut in half and fills the second half with a copy. */
   const duplicateCut = useCallback(() => {
@@ -1080,12 +1083,13 @@ export default function Home() {
       return;
     }
     const id = newCutId();
+    pushHistory();
     if (mutate({ type: "split", at, id, content: { ...cutContent(cut), title: cut.title, note: cut.note } })) {
       setActiveId(id);
       seek(at);
       setToast("カットを複製しました");
     }
-  }, [activeId, mutate, seek]);
+  }, [activeId, mutate, pushHistory, seek]);
 
   const updateActive = (patch: { title?: string; note?: string }) =>
     mutate({ type: "patch", cutId: activeId, patch });
@@ -1094,6 +1098,7 @@ export default function Home() {
   const updateActiveDuration = (seconds: number) => {
     const next = cuts[activeIndex + 1];
     if (!next) return;
+    pushHistory();
     mutate({ type: "move", cutId: next.id, start: activeCut.start + Math.max(MIN_CUT_DURATION, seconds) });
   };
 
@@ -1163,8 +1168,8 @@ export default function Home() {
       if (!mutate({ type: "replace", project: bundle.project })) return;
       if (bundle.projectName) renameProject(bundle.projectName);
       setActiveId(bundle.project.cuts[0].id);
-      historyRef.current = {};
-      redoRef.current = {};
+      historyRef.current = [];
+      redoRef.current = [];
       seek(0);
       setToast(bundle.strokesRestored
         ? `${bundle.project.cuts.length}カットを読み込みました`
@@ -1345,6 +1350,7 @@ export default function Home() {
       setDrag((current) => (current ? { ...current, start } : current));
     };
     const onUp = () => {
+      pushHistory();
       if (mutate({ type: "move", cutId: drag.cutId, start: drag.start })) {
         setToast(`区切りを ${formatFramePosition(drag.start)} に移動しました`);
       }
@@ -1358,7 +1364,7 @@ export default function Home() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [drag, boundaryRange, mutate, timeAtClientX]);
+  }, [drag, boundaryRange, mutate, pushHistory, timeAtClientX]);
 
   /** Keyboard equivalent of dragging, so boundaries are reachable without a pointer. */
   const nudgeBoundary = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -1369,6 +1375,7 @@ export default function Home() {
     const { lower, upper } = boundaryRange(index);
     if (upper < lower) return;
     const cut = projectRef.current.cuts[index];
+    pushHistory();
     mutate({ type: "move", cutId: cut.id, start: Math.min(Math.max(cut.start + step, lower), upper) });
   };
 
