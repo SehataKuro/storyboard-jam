@@ -1371,6 +1371,12 @@ export default function Home() {
       setToast(editBlockedMessage("音源を読み込んで"));
       return;
     }
+    // iCloud placeholders arrive as empty files; loading one would silently do nothing.
+    if (file.size === 0) {
+      event.target.value = "";
+      setToast("音源を読み込めませんでした。端末にダウンロード済みのファイルを選んでください");
+      return;
+    }
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     const url = URL.createObjectURL(file);
     setAudioUrl(url);
@@ -1386,6 +1392,7 @@ export default function Home() {
       mutate({ type: "duration", value: probe.duration });
       setToast(`楽曲に合わせて全体を ${formatFramePosition(probe.duration)} にしました`);
     };
+    probe.onerror = () => setToast("この音源は再生できませんでした。別の形式をお試しください");
   };
 
   /**
