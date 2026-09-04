@@ -450,6 +450,18 @@ export default function Home() {
   const [evicted, setEvicted] = useState(false);
   /** Whether this room asks newcomers for a passphrase. */
   const [roomLocked, setRoomLocked] = useState(false);
+  /**
+   * The passphrase dialog. It replaces window.prompt, which shows what is typed
+   * and leaves the board readable behind it.
+   */
+  const [passwordAsk, setPasswordAsk] = useState<{
+    mode: "join" | "set";
+    retry: boolean;
+    resolve: (value: string | null) => void;
+  } | null>(null);
+  const [passwordDraft, setPasswordDraft] = useState("");
+  /** True once the join prompt was dismissed: the room stays sealed in this tab. */
+  const [lockedOut, setLockedOut] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -476,9 +488,15 @@ export default function Home() {
   const activeIdRef = useRef("");
   const roomRef = useRef<Room | null>(null);
   const roomIdRef = useRef<string | null>(null);
+  /** Held in a ref because the room is built once, before askPassword is defined. */
+  const askPasswordRef = useRef<(mode: "join" | "set", retry: boolean) => Promise<string | null>>(
+    async () => null,
+  );
   const projectRef = useRef<Project>(project);
   const projectNameRef = useRef(projectName);
   const roleRef = useRef<RoomRole>("connecting");
+  const lockedOutRef = useRef(false);
+  const passwordInputRef = useRef<HTMLInputElement>(null);
 
   // While dragging a boundary the UI shows the pending position, not the committed one.
   const displayProject = useMemo(
@@ -496,6 +514,7 @@ export default function Home() {
 
   useEffect(() => { projectRef.current = project; }, [project]);
   useEffect(() => { roleRef.current = role; }, [role]);
+  useEffect(() => { lockedOutRef.current = lockedOut; }, [lockedOut]);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { projectNameRef.current = projectName; }, [projectName]);
   useEffect(() => { setDurationInput(formatFrameDuration(activeDuration)); }, [activeDuration, activeId]);
@@ -506,9 +525,28 @@ export default function Home() {
    * copy can never be published again, so it stays read-only rather than letting
    * work pile up that nobody will ever receive.
    */
-  const readOnly = (role === "closed" && !roomRef.current?.isOwner()) || role === "waiting";
+  const readOnly = lockedOut || (role === "closed" && !roomRef.current?.isOwner()) || role === "waiting";
+
+  /** Opens the masked passphrase dialog and resolves with what was entered, or null. */
+  const askPassword = useCallback((mode: "join" | "set", retry: boolean) => new Promise<string | null>((resolve) => {
+    setPasswordDraft("");
+    setPasswordAsk({ mode, retry, resolve });
+  }), []);
+
+  useEffect(() => { askPasswordRef.current = askPassword; }, [askPassword]);
+  // The dialog is the only thing on screen while it is open, so it takes the caret.
+  useEffect(() => { if (passwordAsk) passwordInputRef.current?.focus(); }, [passwordAsk]);
+
+  const closePasswordAsk = useCallback((value: string | null) => {
+    setPasswordAsk((current) => {
+      current?.resolve(value);
+      return null;
+    });
+    setPasswordDraft("");
+  }, []);
 
   const editBlockedMessage = (action = "編集") => {
+    if (lockedOutRef.current) return "パスワードを入力していないため、このルームは編集できません";
     if (roleRef.current === "waiting") return "ホストの再接続を待っています。戻るまで編集できません";
     if (roleRef.current === "closed") return "ホストが退出したため、この端末では編集できません";
     return `接続が完了してから${action}してください`;
@@ -544,11 +582,11 @@ export default function Home() {
       setToast("パスワードを設定できるのはホストだけです");
       return;
     }
-    const password = window.prompt("このルームのパスワード（空欄で解除）", "");
+    const password = await askPassword("set", false);
     if (password === null) return;
     await room.setPassword(password);
     setToast(password ? "ルームにパスワードを設定しました" : "ルームのパスワードを解除しました");
-  }, []);
+  }, [askPassword]);
 
   /** Rooms are bound to the tab at mount, so switching means a real navigation. */
   const openRoom = useCallback((roomId: string) => {
@@ -625,7 +663,7 @@ export default function Home() {
   // after the host disconnects and the room elects a replacement.
   useEffect(() => {
     const roomId = roomIdRef.current;
-    if (role === "connecting" || !roomId) return;
+    if (role === "connecting" || !roomId || lockedOut) return;
     try {
       window.localStorage.setItem(roomStorageKey(roomId), JSON.stringify({ project, projectName }));
     } catch {
@@ -640,7 +678,7 @@ export default function Home() {
       role: window.localStorage.getItem(ownerKeyStorageKey(roomId)) ? "host" : "guest",
       updatedAt: Date.now(),
     });
-  }, [project, projectName, role]);
+  }, [project, projectName, role, lockedOut]);
 
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -705,10 +743,11 @@ export default function Home() {
       onRoster: setParticipants,
       onEvicted: () => setEvicted(true),
       onProtected: setRoomLocked,
-      requestPassword: async (retry) => window.prompt(
-        retry ? "パスワードが違います。もう一度入力してください" : "このルームはパスワードで保護されています",
-        "",
-      ),
+      requestPassword: async (retry) => {
+        const value = await askPasswordRef.current("join", retry);
+        setLockedOut(value === null);
+        return value;
+      },
       onOp: (op) => {
         if (op.type === "rename") {
           projectNameRef.current = op.value;
@@ -1940,6 +1979,39 @@ export default function Home() {
             <strong>ショートカット</strong>
             <dl>{SHORTCUTS.map(([keys, label]) => <div key={keys}><dt><kbd>{keys}</kbd></dt><dd>{label}</dd></div>)}</dl>
             <button onClick={() => setHelpOpen(false)}>閉じる</button>
+          </div>
+        </div>
+      )}
+
+      {passwordAsk && (
+        <div className="export-overlay password-overlay">
+          <form className="password-card" role="dialog" aria-label="パスワード"
+            onSubmit={(event) => { event.preventDefault(); closePasswordAsk(passwordDraft); }}>
+            <strong>{passwordAsk.mode === "set" ? "ルームのパスワード" : "パスワードが必要です"}</strong>
+            <small>{passwordAsk.mode === "set"
+              ? "空欄のまま決定すると、パスワードを解除します"
+              : passwordAsk.retry ? "パスワードが違います。もう一度入力してください" : "このルームはパスワードで保護されています"}</small>
+            <input ref={passwordInputRef} type="password" autoComplete={passwordAsk.mode === "set" ? "new-password" : "current-password"}
+              value={passwordDraft} onChange={(event) => setPasswordDraft(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Escape") closePasswordAsk(null); }} />
+            <div className="password-actions">
+              <button type="button" onClick={() => closePasswordAsk(null)}>キャンセル</button>
+              <button type="submit" className="primary">決定</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {lockedOut && !passwordAsk && (
+        // An opaque screen, not a banner: without the passphrase nothing in this
+        // room may be read or edited, including the copy cached on this device.
+        <div className="export-overlay locked-overlay" role="dialog" aria-label="ロックされたルーム">
+          <div className="password-card">
+            <strong>ルームはロックされています</strong>
+            <small>パスワードを入力していないため、内容の表示も編集もできません。</small>
+            <div className="password-actions">
+              <button type="button" className="primary" onClick={() => window.location.reload()}>パスワードを入力する</button>
+            </div>
           </div>
         </div>
       )}

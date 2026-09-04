@@ -140,6 +140,18 @@ button { cursor:pointer; }
 .export-bar { height:6px; border-radius:99px; background:#e6e0d4; overflow:hidden; }
 .export-bar i { display:block; height:100%; background:var(--accent); transition:width .18s ease; }
 .export-card small { font-size:10px; color:var(--muted); }
+/* The passphrase dialog hides the board behind it: an unlocked room must not be
+   readable over the shoulder of whoever is typing. */
+.password-overlay, .locked-overlay { background:rgba(30,28,24,.92); backdrop-filter:blur(10px); z-index:40; }
+.password-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px 24px;
+  min-width:300px; display:flex; flex-direction:column; gap:10px; box-shadow:0 12px 32px rgba(0,0,0,.24); }
+.password-card strong { font-size:12px; letter-spacing:.06em; }
+.password-card small { font-size:10px; color:var(--muted); }
+.password-card input { padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; letter-spacing:.18em; }
+.password-actions { display:flex; justify-content:flex-end; gap:8px; }
+.password-actions button { padding:7px 14px; border:1px solid var(--line); border-radius:8px; background:var(--panel); cursor:pointer; font-size:11px; }
+.password-actions button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+
 @media (max-width:900px) { .export-actions button { padding:7px 8px; font-size:10px; } }
 @media (max-width:680px) { .export-actions { display:none; } }
 
