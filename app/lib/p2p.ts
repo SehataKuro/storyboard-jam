@@ -115,6 +115,79 @@ const ICE_SERVERS: RTCIceServer[] = [
 type Link = { pc: RTCPeerConnection; channel: RTCDataChannel | null };
 
 /**
+ * A data channel refuses any single message much past 64KB, and the send throws
+ * instead of the message simply arriving late. One pasted background image is
+ * already far bigger than that, so the snapshot carrying it used to vanish and
+ * the guest sat looking at an empty board. Everything therefore goes over in
+ * pieces small enough that no browser argues about them.
+ */
+const CHUNK_SIZE = 16_000;
+/** Marks a piece. Plain messages are JSON, which never starts with this byte. */
+const CHUNK_PREFIX = "";
+/** Let the pipe drain before pushing more, so a big board cannot burst past it. */
+const BUFFER_LIMIT = 1 << 20;
+
+let chunkSeq = 0;
+
+/** Resolves once the channel has flushed enough to accept more, or is gone. */
+function drain(channel: RTCDataChannel) {
+  return new Promise<void>((resolve) => {
+    channel.bufferedAmountLowThreshold = BUFFER_LIMIT / 2;
+    const done = () => {
+      channel.removeEventListener("bufferedamountlow", done);
+      channel.removeEventListener("close", done);
+      resolve();
+    };
+    channel.addEventListener("bufferedamountlow", done);
+    channel.addEventListener("close", done);
+  });
+}
+
+async function sendChunks(channel: RTCDataChannel, id: string, text: string, total: number) {
+  for (let index = 0; index < total; index += 1) {
+    if (channel.readyState !== "open") return;
+    if (channel.bufferedAmount > BUFFER_LIMIT) await drain(channel);
+    if (channel.readyState !== "open") return;
+    const part = text.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE);
+    try {
+      channel.send(`${CHUNK_PREFIX}${id}:${index}:${total}:${part}`);
+    } catch {
+      return; // the channel died mid-board; the next snapshot starts over
+    }
+  }
+}
+
+/** Send anything over a channel, split up when it is too big to go at once. */
+function sendMessage(channel: RTCDataChannel | null | undefined, payload: unknown) {
+  if (!channel || channel.readyState !== "open") return;
+  const text = JSON.stringify(payload);
+  if (text.length <= CHUNK_SIZE) {
+    try { channel.send(text); } catch { /* the channel closed under us */ }
+    return;
+  }
+  chunkSeq += 1;
+  void sendChunks(channel, `${chunkSeq}`, text, Math.ceil(text.length / CHUNK_SIZE));
+}
+
+/**
+ * Puts a chunked message back together. Returns the whole text once the last
+ * piece lands, and null while pieces are still outstanding.
+ */
+function joinChunks(pending: Map<string, string[]>, raw: string) {
+  const head = raw.indexOf(":", raw.indexOf(":", raw.indexOf(":") + 1) + 1);
+  const [id, indexText, totalText] = raw.slice(1, head).split(":");
+  const index = Number(indexText);
+  const total = Number(totalText);
+  if (!id || !Number.isInteger(index) || !Number.isInteger(total) || total < 1) return null;
+  const parts = pending.get(id) ?? new Array<string>(total).fill("");
+  parts[index] = raw.slice(head + 1);
+  pending.set(id, parts);
+  if (parts.some((part) => part === "")) return null;
+  pending.delete(id);
+  return parts.join("");
+}
+
+/**
  * Host-authoritative mesh: the host holds the project and pushes snapshots,
  * guests only propose operations. Playback position is deliberately never sent.
  */
@@ -131,6 +204,20 @@ export class Room {
   /** Host only: the display name each guest sent over its data channel. */
   private names = new Map<string, string>();
   private evicted = false;
+  /**
+   * Host: how many times each cut's drawing has changed, and the cuts as they
+   * were last published. A guest edit replaces a whole cut, so without this a
+   * guest working from a snapshot it never received would hand the host an empty
+   * cut and the host's drawing would be gone.
+   */
+  private revisions = new Map<string, number>();
+  private published = new Map<string, { strokes: Stroke[]; backgroundImage?: string }>();
+  /** Who last changed each cut: a peer id, or null for the host itself. */
+  private revisionAuthor = new Map<string, string | null>();
+  /** The guest whose op is being applied right now, set only for that moment. */
+  private applying: string | null = null;
+  /** Guest: the revisions that came with the last snapshot from the host. */
+  private hostRevisions = new Map<string, number>();
   /** Where this tab remembers the owner key of a room it hosts. */
   private readOwnerKey() {
     try {
@@ -228,7 +315,7 @@ export class Room {
       return;
     }
     const link = this.hostId ? this.links.get(this.hostId) : null;
-    if (link?.channel?.readyState === "open") link.channel.send(JSON.stringify({ type: "hello", name }));
+    sendMessage(link?.channel, { type: "hello", name });
   }
 
   /**
@@ -273,10 +360,7 @@ export class Room {
       ...[...this.links.keys()].map((id) => ({ id, name: this.names.get(id) || "", isHost: false })),
     ];
     this.handlers.onRoster(participants);
-    const payload = JSON.stringify({ type: "roster", participants });
-    this.links.forEach((link) => {
-      if (link.channel?.readyState === "open") link.channel.send(payload);
-    });
+    this.links.forEach((link) => sendMessage(link.channel, { type: "roster", participants }));
   }
 
   /**
@@ -304,20 +388,53 @@ export class Room {
     return this.authCancelled;
   }
 
+  /**
+   * Host: note which cuts changed since the last publish. Edits are immutable,
+   * so a cut whose drawing is the same object has not been touched.
+   */
+  private bumpRevisions(project: Project) {
+    const published = new Map<string, { strokes: Stroke[]; backgroundImage?: string }>();
+    project.cuts.forEach((cut) => {
+      published.set(cut.id, { strokes: cut.strokes, backgroundImage: cut.backgroundImage });
+      const before = this.published.get(cut.id);
+      if (!before) {
+        this.revisions.set(cut.id, this.revisions.get(cut.id) ?? 0);
+        return;
+      }
+      if (before.strokes !== cut.strokes || before.backgroundImage !== cut.backgroundImage) {
+        this.revisions.set(cut.id, (this.revisions.get(cut.id) ?? 0) + 1);
+        this.revisionAuthor.set(cut.id, this.applying);
+      }
+    });
+    this.published = published;
+    // Forget cuts that no longer exist, so a room does not grow a tail of them.
+    [...this.revisions.keys()].forEach((id) => {
+      if (published.has(id)) return;
+      this.revisions.delete(id);
+      this.revisionAuthor.delete(id);
+    });
+  }
+
+  private revisionRecord() {
+    return Object.fromEntries(this.revisions);
+  }
+
   /** Host: push the authoritative project to every guest. */
   broadcastSnapshot(project: Project, projectName: string) {
     if (this.role !== "host") return;
-    const payload = JSON.stringify({ type: "snapshot", project, projectName });
-    this.links.forEach((link) => {
-      if (link.channel?.readyState === "open") link.channel.send(payload);
-    });
+    this.bumpRevisions(project);
+    const payload = { type: "snapshot", project, projectName, revisions: this.revisionRecord() };
+    this.links.forEach((link) => sendMessage(link.channel, payload));
   }
 
   /** Guest: propose an edit to the host. */
   sendOp(op: RoomOp) {
     if (this.role !== "guest") return;
     const link = this.hostId ? this.links.get(this.hostId) : null;
-    if (link?.channel?.readyState === "open") link.channel.send(JSON.stringify({ type: "op", op }));
+    // Ops that carry a whole cut say which version of it they were drawn on, so
+    // the host can tell a normal edit from one based on a board it no longer has.
+    const base = op.type === "strokes" || op.type === "content" ? this.hostRevisions.get(op.cutId) ?? 0 : undefined;
+    sendMessage(link?.channel, { type: "op", op, base });
   }
 
   private setRole(role: RoomRole) {
@@ -496,30 +613,70 @@ export class Room {
   private bindChannel(peerId: string, channel: RTCDataChannel) {
     const link = this.links.get(peerId);
     if (link) link.channel = channel;
+    /** Pieces of oversized messages seen on this channel so far. */
+    const pending = new Map<string, string[]>();
     channel.onopen = () => {
       this.handlers.onPeers(this.links.size);
       if (this.role === "host") {
-        channel.send(JSON.stringify({ type: "snapshot", ...this.handlers.getSnapshot() }));
+        const snapshot = this.handlers.getSnapshot();
+        this.bumpRevisions(snapshot.project);
+        sendMessage(channel, { type: "snapshot", ...snapshot, revisions: this.revisionRecord() });
         this.handlers.onStatus("参加者が入室しました");
         this.publishRoster();
       } else {
         this.handlers.onStatus("ホストに接続しました");
-        channel.send(JSON.stringify({ type: "hello", name: this.selfName }));
+        sendMessage(channel, { type: "hello", name: this.selfName });
       }
     };
     channel.onmessage = (event) => {
-      const data = JSON.parse(event.data as string) as {
+      const raw = typeof event.data === "string" ? event.data : "";
+      const text = raw.startsWith(CHUNK_PREFIX) ? joinChunks(pending, raw) : raw;
+      if (!text) return;
+      let data: {
         type: string;
         project?: Project;
         projectName?: string;
         op?: RoomOp;
+        base?: number;
+        revisions?: Record<string, number>;
         name?: string;
         participants?: Participant[];
       };
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return; // a half-delivered message is not worth acting on
+      }
       if (data.type === "snapshot" && data.project && this.role === "guest") {
+        this.hostRevisions = new Map(Object.entries(data.revisions || {}));
         this.handlers.onSnapshot({ project: data.project, projectName: data.projectName || "" });
       }
-      if (data.type === "op" && data.op && this.role === "host") this.handlers.onOp(data.op);
+      if (data.type === "stale" && this.role === "guest") {
+        this.handlers.onStatus("ホスト側の内容が新しかったため、直前の変更は取り消されました");
+      }
+      if (data.type === "op" && data.op && this.role === "host") {
+        const op = data.op;
+        if (op.type === "strokes" || op.type === "content") {
+          // The guest drew on a version of this cut the host has since moved past,
+          // so taking the op would throw away whatever it has not seen yet.
+          const current = this.revisions.get(op.cutId) ?? 0;
+          // Being behind one's own last edit is not being stale: a guest drawing
+          // quickly sends the next stroke before its snapshot has come back.
+          const ours = this.revisionAuthor.get(op.cutId) === peerId;
+          if ((data.base ?? 0) !== current && !ours) {
+            const snapshot = this.handlers.getSnapshot();
+            sendMessage(channel, { type: "snapshot", ...snapshot, revisions: this.revisionRecord() });
+            sendMessage(channel, { type: "stale" });
+            return;
+          }
+        }
+        this.applying = peerId;
+        try {
+          this.handlers.onOp(op);
+        } finally {
+          this.applying = null;
+        }
+      }
       if (data.type === "hello" && this.role === "host") {
         this.names.set(peerId, data.name || "");
         this.publishRoster();
