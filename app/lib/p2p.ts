@@ -111,6 +111,8 @@ export class Room {
   /** Digest of the passphrase this tab is holding, host or guest. */
   private passwordHash: string | null = null;
   private wrongPassword = false;
+  /** Set when the passphrase prompt was dismissed: this tab never got in. */
+  private authCancelled = false;
 
   constructor(private room: string, private handlers: RoomHandlers) {}
 
@@ -215,6 +217,9 @@ export class Room {
    * host is gone would silently diverge and then be lost.
    */
   canEdit() {
+    // Dismissing the passphrase prompt means we were never let into the room, so
+    // nothing here may be edited, not even the recovery copy this tab still holds.
+    if (this.authCancelled) return false;
     if (this.role === "host") return true;
     if (this.role === "closed") return this.ownsProject;
     if (this.role !== "guest" || !this.hostId) return false;
@@ -223,7 +228,12 @@ export class Room {
 
   /** True once this tab has held the board, so a closed room stays editable for it. */
   isOwner() {
-    return this.ownsProject;
+    return this.ownsProject && !this.authCancelled;
+  }
+
+  /** True while this tab is sitting outside a protected room it declined to unlock. */
+  isLockedOut() {
+    return this.authCancelled;
   }
 
   /** Host: push the authoritative project to every guest. */
@@ -268,12 +278,14 @@ export class Room {
       if (message.needsPassword) {
         const password = await this.handlers.requestPassword(this.wrongPassword);
         if (password === null) {
+          this.authCancelled = true;
           this.closedByUs = true;
           this.setRole("closed");
           this.handlers.onStatus("パスワードの入力を中止しました");
           this.socket?.close();
           return;
         }
+        this.authCancelled = false;
         this.passwordHash = await hashPassword(password);
       }
       this.handlers.onProtected(Boolean(message.needsPassword));
@@ -293,6 +305,7 @@ export class Room {
       this.hostId = message.hostId || null;
       this.selfId = message.peerId || null;
       this.wrongPassword = false;
+      this.authCancelled = false;
       if (message.ownerKey) this.writeOwnerKey(message.ownerKey);
       this.setRole(message.isHost ? "host" : "guest");
       this.handlers.onStatus(message.isHost ? "ホストとしてルームを開きました" : "ホストへ接続中…");
