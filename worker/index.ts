@@ -22,6 +22,29 @@ interface ExecutionContext {
 type Peer = { id: string; socket: WebSocket };
 
 /**
+ * How a stored passphrase digest was derived. "v1" is the original bare SHA-256,
+ * kept only so rooms protected before the change still open; everything new is
+ * "v2", a PBKDF2 digest salted with the room name.
+ */
+type PasswordScheme = "v1" | "v2";
+
+/** Wrong guesses tolerated before answers start being delayed. */
+const FREE_ATTEMPTS = 5;
+/** Ceiling on the backoff, so a room is never locked away for good. */
+const MAX_LOCKOUT_MS = 5 * 60_000;
+
+/**
+ * Compare two digests without letting the time taken reveal how much of a guess
+ * was right. Length is not secret: both sides are fixed-width hex.
+ */
+function digestsMatch(a: string, b: string) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index += 1) diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  return diff === 0;
+}
+
+/**
  * Relays SDP/ICE between peers of one room. It never sees storyboard data:
  * the host peer holds the authoritative project, so when the host leaves the room is closed.
  *
@@ -33,8 +56,13 @@ type Peer = { id: string; socket: WebSocket };
 export class SignalRoom {
   private peers = new Map<string, Peer>();
   private hostId: string | null = null;
-  /** SHA-256 of the room passphrase, chosen by the host. Never the plain text. */
+  /** Digest of the room passphrase, chosen by the host. Never the plain text. */
   private passwordHash: string | null = null;
+  /** Which derivation the stored digest uses, so older rooms keep opening. */
+  private passwordScheme: PasswordScheme = "v2";
+  /** Wrong guesses so far, and when the current backoff expires. */
+  private failures = 0;
+  private lockedUntil = 0;
   /** Secret minted for the room's creator and rotated on every handover. */
   private ownerKey: string | null = null;
   /** The key each joined peer presented, so the owner can be found again. */
@@ -52,11 +80,52 @@ export class SignalRoom {
     state.blockConcurrencyWhile(async () => {
       this.ownerKey = (await state.storage.get<string>("ownerKey")) ?? null;
       this.passwordHash = (await state.storage.get<string>("passwordHash")) ?? null;
+      // A room stored before schemes existed holds a bare SHA-256.
+      this.passwordScheme = (await state.storage.get<PasswordScheme>("passwordScheme"))
+        ?? (this.passwordHash ? "v1" : "v2");
+      this.failures = (await state.storage.get<number>("failures")) ?? 0;
+      this.lockedUntil = (await state.storage.get<number>("lockedUntil")) ?? 0;
     });
   }
 
   private persist() {
-    return this.state.storage.put({ ownerKey: this.ownerKey, passwordHash: this.passwordHash });
+    return this.state.storage.put({
+      ownerKey: this.ownerKey,
+      passwordHash: this.passwordHash,
+      passwordScheme: this.passwordScheme,
+    });
+  }
+
+  /**
+   * Guessing has to stay slow even though the digest is checked in one comparison.
+   * The counter is persisted because it would otherwise reset every time the room
+   * is evicted, and going quiet for a minute is enough to bring that about.
+   */
+  private noteFailure() {
+    this.failures += 1;
+    if (this.failures > FREE_ATTEMPTS) {
+      const backoff = Math.min(1000 * 2 ** (this.failures - FREE_ATTEMPTS - 1), MAX_LOCKOUT_MS);
+      this.lockedUntil = Date.now() + backoff;
+    }
+    void this.state.storage.put({ failures: this.failures, lockedUntil: this.lockedUntil });
+  }
+
+  private clearFailures() {
+    if (this.failures === 0 && this.lockedUntil === 0) return;
+    this.failures = 0;
+    this.lockedUntil = 0;
+    void this.state.storage.put({ failures: 0, lockedUntil: 0 });
+  }
+
+  /** Milliseconds left on the backoff, or 0 when a guess may be checked now. */
+  private lockoutLeft() {
+    return Math.max(0, this.lockedUntil - Date.now());
+  }
+
+  /** Turn a peer away for a wrong passphrase, telling it how long to hold off. */
+  private deny(peer: Peer, retryAfter: number) {
+    this.send(peer, { type: "denied", retryAfter });
+    try { peer.socket.close(1008, "wrong password"); } catch { /* already closing */ }
   }
 
   fetch(request: Request): Response {
@@ -72,33 +141,50 @@ export class SignalRoom {
     const peer: Peer = { id, socket: server };
     // The peer is in neither map until it has answered the gate: an
     // unauthenticated socket must not be able to see or signal anyone.
-    this.send(peer, { type: "gate", isFirst: this.ownerKey === null, needsPassword: this.passwordHash !== null });
+    // Deliberately silent about whether the room has ever been opened: that would
+    // let anyone map which room names are in use just by guessing at them.
+    this.send(peer, {
+      type: "gate",
+      needsPassword: this.passwordHash !== null,
+      scheme: this.passwordHash ? this.passwordScheme : undefined,
+    });
 
     const admit = (isHost: boolean, ownerKey?: string) => {
       this.peers.set(id, peer);
       this.send(peer, { type: "welcome", peerId: id, isHost, hostId: this.hostId, ownerKey });
     };
 
-    const join = (hash: string | null, ownerKey: string | null) => {
+    const join = (hash: string | null, ownerKey: string | null, scheme: PasswordScheme) => {
+      const waitMs = this.passwordHash ? this.lockoutLeft() : 0;
+      if (waitMs > 0) {
+        // Too many wrong guesses: nothing is compared until the backoff runs out.
+        this.deny(peer, waitMs);
+        return;
+      }
       // Nobody has ever hosted this room, so this peer opens it and takes the key.
       if (this.ownerKey === null) {
         this.ownerKey = crypto.randomUUID();
         this.passwordHash = hash;
+        this.passwordScheme = scheme;
         this.hostId = id;
         void this.persist();
         admit(true, this.ownerKey);
         return;
       }
+      // The passphrase is checked before anything else, the owner key included.
+      // The key says who may host the room; it is not a way past the door, or the
+      // room would be open to whoever created it no matter what it was locked with.
+      if (this.passwordHash && !digestsMatch(hash ?? "", this.passwordHash)) {
+        this.noteFailure();
+        this.deny(peer, this.lockoutLeft());
+        return;
+      }
+      this.clearFailures();
       if (this.hostId === null) {
         // The room exists but its host is away. Only the owner can reopen it:
         // anyone else would be hosting a board they do not have. They wait here
         // rather than being turned away, and are let in when the host returns.
-        if (ownerKey !== this.ownerKey) {
-          if (this.passwordHash && hash !== this.passwordHash) {
-            this.send(peer, { type: "denied" });
-            try { server.close(1008, "wrong password"); } catch { /* already closing */ }
-            return;
-          }
+        if (!digestsMatch(ownerKey ?? "", this.ownerKey)) {
           this.waiting.set(id, { peer, hash, ownerKey });
           this.send(peer, { type: "waiting" });
           return;
@@ -106,11 +192,6 @@ export class SignalRoom {
         this.hostId = id;
         admit(true);
         this.admitWaiting();
-        return;
-      }
-      if (this.passwordHash && hash !== this.passwordHash) {
-        this.send(peer, { type: "denied" });
-        try { server.close(1008, "wrong password"); } catch { /* already closing */ }
         return;
       }
       // A host that reloaded lands here: its previous socket is still counted as
@@ -122,20 +203,27 @@ export class SignalRoom {
     };
 
     server.addEventListener("message", (event) => {
-      let message: { type?: string; to?: string; payload?: unknown; hash?: string | null; ownerKey?: string | null };
+      let message: {
+        type?: string; to?: string; payload?: unknown;
+        hash?: string | null; ownerKey?: string | null; scheme?: string;
+      };
       try {
         message = JSON.parse(typeof event.data === "string" ? event.data : "");
       } catch {
         return;
       }
       if (message.type === "auth") {
-        if (!this.peers.has(id) && !this.waiting.has(id)) join(message.hash ?? null, message.ownerKey ?? null);
+        if (!this.peers.has(id) && !this.waiting.has(id)) {
+          join(message.hash ?? null, message.ownerKey ?? null, message.scheme === "v1" ? "v1" : "v2");
+        }
         return;
       }
       // Waiting peers are not in the room yet, so they may not signal anyone.
       if (!this.peers.has(id)) return;
       if (message.type === "set-password" && id === this.hostId) {
         this.passwordHash = message.hash ?? null;
+        this.passwordScheme = message.scheme === "v1" ? "v1" : "v2";
+        this.clearFailures();
         void this.persist();
         return;
       }
@@ -199,9 +287,8 @@ export class SignalRoom {
     const host = this.hostId ? this.peers.get(this.hostId) : null;
     this.waiting.forEach((entry, waitingId) => {
       // The passphrase may have changed while they waited.
-      if (this.passwordHash && entry.hash !== this.passwordHash) {
-        this.send(entry.peer, { type: "denied" });
-        try { entry.peer.socket.close(1008, "wrong password"); } catch { /* already closing */ }
+      if (this.passwordHash && !digestsMatch(entry.hash ?? "", this.passwordHash)) {
+        this.deny(entry.peer, 0);
         return;
       }
       this.peers.set(waitingId, entry.peer);

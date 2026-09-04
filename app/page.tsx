@@ -112,6 +112,46 @@ const HISTORY_LIMIT = 60;
 const guestLabel = (participant: Participant, index: number) =>
   participant.name.trim() || (participant.isHost ? "ホスト" : `ゲスト${index}`);
 const roomStorageKey = (roomId: string) => `${LEGACY_STORAGE_KEY}:${roomId}`;
+
+/** A recovery copy that only the passphrase can open. */
+type SealedBackup = { sealed: 1; iv: string; data: string };
+type PlainBackup = { project?: Project; projectName?: string };
+
+const isSealed = (value: unknown): value is SealedBackup =>
+  typeof value === "object" && value !== null && (value as SealedBackup).sealed === 1;
+
+const bytesToBase64 = (bytes: Uint8Array) => {
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary);
+};
+
+const base64ToBytes = (value: string) =>
+  Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+
+async function sealBackup(key: CryptoKey, payload: PlainBackup): Promise<SealedBackup> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  return { sealed: 1, iv: bytesToBase64(iv), data: bytesToBase64(new Uint8Array(data)) };
+}
+
+async function openBackup(key: CryptoKey, backup: SealedBackup): Promise<PlainBackup | null> {
+  try {
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(backup.iv) },
+      key,
+      base64ToBytes(backup.data),
+    );
+    return JSON.parse(new TextDecoder().decode(plain)) as PlainBackup;
+  } catch {
+    // Written under a passphrase that has since been changed: it is not recoverable.
+    return null;
+  }
+}
 const ROOM_INDEX_KEY = "conte-live-rooms";
 /**
  * Backups of rooms hosted by someone else are only a courtesy copy, so they are
@@ -462,6 +502,14 @@ export default function Home() {
   const [passwordDraft, setPasswordDraft] = useState("");
   /** True once the join prompt was dismissed: the room stays sealed in this tab. */
   const [lockedOut, setLockedOut] = useState(false);
+  /** Encrypts this device's recovery copy while the room is protected. */
+  const [cacheKey, setCacheKey] = useState<CryptoKey | null>(null);
+  /**
+   * True while a sealed copy is waiting to be opened. Nothing may be written over
+   * it until then: an empty board saved in the meantime would destroy the only
+   * copy this device has of a protected room.
+   */
+  const [backupHeld, setBackupHeld] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -497,6 +545,12 @@ export default function Home() {
   const roleRef = useRef<RoomRole>("connecting");
   const lockedOutRef = useRef(false);
   const passwordInputRef = useRef<HTMLInputElement>(null);
+  /** A sealed copy found at mount, held until the passphrase can open it. */
+  const sealedBackupRef = useRef<SealedBackup | null>(null);
+  /** Guards the sealed copy from landing on top of the host's newer snapshot. */
+  const snapshotSeenRef = useRef(false);
+  /** Orders the asynchronous backup writes, so a slow one cannot win. */
+  const backupSeqRef = useRef(0);
 
   // While dragging a boundary the UI shows the pending position, not the committed one.
   const displayProject = useMemo(
@@ -663,11 +717,23 @@ export default function Home() {
   // after the host disconnects and the room elects a replacement.
   useEffect(() => {
     const roomId = roomIdRef.current;
-    if (role === "connecting" || !roomId || lockedOut) return;
-    try {
-      window.localStorage.setItem(roomStorageKey(roomId), JSON.stringify({ project, projectName }));
-    } catch {
-      setToast("端末の保存容量が足りないため、バックアップできませんでした");
+    if (role === "connecting" || !roomId || lockedOut || backupHeld) return;
+    const seq = (backupSeqRef.current += 1);
+    const write = (value: string) => {
+      // Sealing is asynchronous, so a slower write must not overwrite a newer one.
+      if (seq !== backupSeqRef.current) return;
+      try {
+        window.localStorage.setItem(roomStorageKey(roomId), value);
+      } catch {
+        setToast("端末の保存容量が足りないため、バックアップできませんでした");
+      }
+    };
+    if (cacheKey) {
+      // Protected rooms are cached sealed: the lock has to hold even for someone
+      // reading this device's storage directly.
+      void sealBackup(cacheKey, { project, projectName }).then((sealed) => write(JSON.stringify(sealed)));
+    } else {
+      write(JSON.stringify({ project, projectName }));
     }
     rememberRoom({
       id: roomId,
@@ -678,7 +744,7 @@ export default function Home() {
       role: window.localStorage.getItem(ownerKeyStorageKey(roomId)) ? "host" : "guest",
       updatedAt: Date.now(),
     });
-  }, [project, projectName, role, lockedOut]);
+  }, [project, projectName, role, lockedOut, cacheKey, backupHeld]);
 
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -706,7 +772,13 @@ export default function Home() {
     }
     if (stored) {
       try {
-        const parsed = JSON.parse(stored) as { project?: Project; projectName?: string };
+        const parsed = JSON.parse(stored) as PlainBackup | SealedBackup;
+        // A protected room's copy stays unreadable until its passphrase arrives.
+        if (isSealed(parsed)) {
+          sealedBackupRef.current = parsed;
+          setBackupHeld(true);
+          throw new Error("sealed");
+        }
         if (parsed.project?.cuts?.length) {
           const restored = normalizeProject(parsed.project);
           projectRef.current = restored;
@@ -733,12 +805,39 @@ export default function Home() {
       onStatus: setToast,
       onPeers: setPeers,
       onSnapshot: (incoming) => {
+        snapshotSeenRef.current = true;
         projectRef.current = incoming.project;
         projectNameRef.current = incoming.projectName;
         setProject(incoming.project);
         setProjectName(incoming.projectName);
         setActiveId((current) => (incoming.project.cuts.some((cut) => cut.id === current) ? current : incoming.project.cuts[0]?.id || current));
         pulse();
+      },
+      onCacheKey: (key) => {
+        setCacheKey(key);
+        const sealed = sealedBackupRef.current;
+        // Nothing to open: either the room is unprotected, or this copy was
+        // already restored. Writing is safe again in both cases.
+        if (!key || !sealed) {
+          setBackupHeld(false);
+          return;
+        }
+        sealedBackupRef.current = null;
+        void openBackup(key, sealed).then((restored) => {
+          // Either it is ours again, or it was sealed under a passphrase that has
+          // since changed and is lost for good. Both free the slot to be rewritten.
+          setBackupHeld(false);
+          // The host's snapshot is authoritative: a copy that lost the race is dropped.
+          if (!restored?.project?.cuts?.length || snapshotSeenRef.current) return;
+          const project = normalizeProject(restored.project);
+          projectRef.current = project;
+          setProject(project);
+          setActiveId(project.cuts[0].id);
+          if (restored.projectName) {
+            projectNameRef.current = restored.projectName;
+            setProjectName(restored.projectName);
+          }
+        });
       },
       onRoster: setParticipants,
       onEvicted: () => setEvicted(true),
@@ -1993,7 +2092,12 @@ export default function Home() {
               : passwordAsk.retry ? "パスワードが違います。もう一度入力してください" : "このルームはパスワードで保護されています"}</small>
             <input ref={passwordInputRef} type="password" autoComplete={passwordAsk.mode === "set" ? "new-password" : "current-password"}
               value={passwordDraft} onChange={(event) => setPasswordDraft(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Escape") closePasswordAsk(null); }} />
+              onKeyDown={(event) => {
+                if (event.key === "Escape") closePasswordAsk(null);
+                // Not left to the form: implicit submission is skipped by some
+                // input methods, and the dialog has to answer the Enter key.
+                if (event.key === "Enter") { event.preventDefault(); closePasswordAsk(passwordDraft); }
+              }} />
             <div className="password-actions">
               <button type="button" onClick={() => closePasswordAsk(null)}>キャンセル</button>
               <button type="submit" className="primary">決定</button>
