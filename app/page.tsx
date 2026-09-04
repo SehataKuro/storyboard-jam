@@ -25,7 +25,7 @@ import {
   parseFrameDuration,
   snapToFrame,
 } from "./lib/types";
-import { Participant, Room, RoomOp, RoomRole, applyOp } from "./lib/p2p";
+import { Participant, Room, RoomOp, RoomRole, applyOp, ownerKeyStorageKey } from "./lib/p2p";
 import { cutLabel } from "./lib/ae";
 import { exportMovie, exportSequenceZip } from "./lib/export-media";
 import { downloadBlob } from "./lib/zip";
@@ -112,6 +112,49 @@ const HISTORY_LIMIT = 60;
 const guestLabel = (participant: Participant, index: number) =>
   participant.name.trim() || (participant.isHost ? "ホスト" : `ゲスト${index}`);
 const roomStorageKey = (roomId: string) => `${LEGACY_STORAGE_KEY}:${roomId}`;
+const ROOM_INDEX_KEY = "conte-live-rooms";
+/**
+ * Backups of rooms hosted by someone else are only a courtesy copy, so they are
+ * capped: local storage is small, and a guest's copies must never crowd out the
+ * boards this browser is the sole owner of.
+ */
+const GUEST_BACKUP_LIMIT = 10;
+
+/** One line per room this browser has opened, newest first. */
+type RoomEntry = { id: string; name: string; role: "host" | "guest"; updatedAt: number };
+
+const readRoomIndex = (): RoomEntry[] => {
+  try {
+    const raw = window.localStorage.getItem(ROOM_INDEX_KEY);
+    const parsed = raw ? (JSON.parse(raw) as RoomEntry[]) : [];
+    return Array.isArray(parsed) ? parsed.filter((entry) => entry && typeof entry.id === "string") : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeRoomIndex = (entries: RoomEntry[]) => {
+  try {
+    window.localStorage.setItem(ROOM_INDEX_KEY, JSON.stringify(entries));
+  } catch { /* the index is a convenience, never the board itself */ }
+};
+
+const forgetRoom = (roomId: string) => {
+  try { window.localStorage.removeItem(roomStorageKey(roomId)); } catch { /* nothing to drop */ }
+};
+
+/** Record this visit, then drop the oldest guest copies over the cap. */
+const rememberRoom = (entry: RoomEntry) => {
+  const entries = [entry, ...readRoomIndex().filter((known) => known.id !== entry.id)]
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const guests = entries.filter((known) => known.role === "guest");
+  guests.slice(GUEST_BACKUP_LIMIT).forEach((stale) => forgetRoom(stale.id));
+  writeRoomIndex(entries.filter((known) => known.role === "host" || guests.indexOf(known) < GUEST_BACKUP_LIMIT));
+  return entries;
+};
+
+const formatVisited = (at: number) => new Date(at)
+  .toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
 const SHORTCUTS: [string, string][] = [
   ["Space", "再生 / 停止"],
@@ -346,6 +389,7 @@ const ROLE_LABEL: Record<RoomRole, string> = {
   connecting: "接続中…",
   host: "ホスト（このタブが原本）",
   guest: "ゲスト参加中",
+  waiting: "ホスト待ち（編集不可）",
   closed: "切断（ローカル編集のみ）",
 };
 
@@ -400,6 +444,8 @@ export default function Home() {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [userName, setUserName] = useState("");
   const [peopleOpen, setPeopleOpen] = useState(false);
+  const [projectsOpen, setProjectsOpen] = useState(false);
+  const [roomEntries, setRoomEntries] = useState<RoomEntry[]>([]);
   /** True once the host has removed us, so reconnecting is not offered. */
   const [evicted, setEvicted] = useState(false);
   /** Whether this room asks newcomers for a passphrase. */
@@ -432,7 +478,7 @@ export default function Home() {
   const roomIdRef = useRef<string | null>(null);
   const projectRef = useRef<Project>(project);
   const projectNameRef = useRef(projectName);
-  const previousRoleRef = useRef<RoomRole>("connecting");
+  const roleRef = useRef<RoomRole>("connecting");
 
   // While dragging a boundary the UI shows the pending position, not the committed one.
   const displayProject = useMemo(
@@ -449,16 +495,30 @@ export default function Home() {
   const exportName = projectName.trim() || "storyboard";
 
   useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => { roleRef.current = role; }, [role]);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { projectNameRef.current = projectName; }, [projectName]);
   useEffect(() => { setDurationInput(formatFrameDuration(activeDuration)); }, [activeDuration, activeId]);
   useEffect(() => { setSelection(null); setSelectionOffset(null); }, [activeId, selectedTool]);
 
+  /**
+   * Why an edit was refused. A guest whose host has left is not just waiting: its
+   * copy can never be published again, so it stays read-only rather than letting
+   * work pile up that nobody will ever receive.
+   */
+  const readOnly = (role === "closed" && !roomRef.current?.isOwner()) || role === "waiting";
+
+  const editBlockedMessage = (action = "編集") => {
+    if (roleRef.current === "waiting") return "ホストの再接続を待っています。戻るまで編集できません";
+    if (roleRef.current === "closed") return "ホストが退出したため、この端末では編集できません";
+    return `接続が完了してから${action}してください`;
+  };
+
   /** Local edits go through here: the host owns state, guests only propose. */
   const mutate = useCallback((op: RoomOp) => {
     const room = roomRef.current;
     if (!room?.canEdit()) {
-      setToast("接続が完了してから編集してください");
+      setToast(editBlockedMessage());
       return false;
     }
     const next = applyOp(projectRef.current, op);
@@ -490,6 +550,48 @@ export default function Home() {
     setToast(password ? "ルームにパスワードを設定しました" : "ルームのパスワードを解除しました");
   }, []);
 
+  /** Rooms are bound to the tab at mount, so switching means a real navigation. */
+  const openRoom = useCallback((roomId: string) => {
+    if (roomId === roomIdRef.current) {
+      setProjectsOpen(false);
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("room", roomId);
+    window.location.href = url.toString();
+  }, []);
+
+  /**
+   * Removing a hosted room throws away the only copy of it, and the owner key with
+   * it, so it asks twice as loudly as dropping a guest's courtesy backup.
+   */
+  const dropRoomEntry = useCallback((entry: RoomEntry) => {
+    const label = entry.name.trim() || "無題のプロジェクト";
+    const warning = entry.role === "host"
+      ? `「${label}」をこの端末から削除しますか？
+この端末が原本を持っているため、二度と開けなくなります。`
+      : `「${label}」の控えを削除しますか？
+原本はホストの端末にあります。`;
+    if (!window.confirm(warning)) return;
+    forgetRoom(entry.id);
+    if (entry.role === "host") {
+      try { window.localStorage.removeItem(ownerKeyStorageKey(entry.id)); } catch { /* already gone */ }
+    }
+    const remaining = readRoomIndex().filter((known) => known.id !== entry.id);
+    writeRoomIndex(remaining);
+    setRoomEntries(remaining);
+  }, []);
+
+  /** The only route by which hosting ever moves, so it asks in plain terms. */
+  const handOverHost = useCallback((participant: Participant, index: number) => {
+    const label = guestLabel(participant, index);
+    if (!window.confirm(
+      `${label} にホストを譲りますか？
+プロジェクトの原本は ${label} の端末に移り、この端末は参加者になります。`,
+    )) return;
+    roomRef.current?.handover(participant.id);
+  }, []);
+
   const kickParticipant = useCallback((participant: Participant, index: number) => {
     if (!window.confirm(`${guestLabel(participant, index)} をルームから退出させますか？`)) return;
     roomRef.current?.kick(participant.id);
@@ -508,7 +610,7 @@ export default function Home() {
   const renameProject = useCallback((value: string) => {
     const room = roomRef.current;
     if (!room?.canEdit()) {
-      setToast("接続が完了してから編集してください");
+      setToast(editBlockedMessage());
       return false;
     }
     projectNameRef.current = value;
@@ -529,6 +631,15 @@ export default function Home() {
     } catch {
       setToast("端末の保存容量が足りないため、バックアップできませんでした");
     }
+    rememberRoom({
+      id: roomId,
+      name: projectName,
+      // Owning the room is a property of the browser, not of this tab: opening
+      // one's own room in a second tab joins as a guest, and reading the role from
+      // there would demote the entry and expose the only copy to the guest cap.
+      role: window.localStorage.getItem(ownerKeyStorageKey(roomId)) ? "host" : "guest",
+      updatedAt: Date.now(),
+    });
   }, [project, projectName, role]);
 
   useEffect(() => {
@@ -619,17 +730,6 @@ export default function Home() {
     room.setName(storedName);
     return () => { room.close(); roomRef.current = null; };
   }, []);
-
-  useEffect(() => {
-    const previousRole = previousRoleRef.current;
-    previousRoleRef.current = role;
-    if (previousRole !== "guest" || role !== "closed" || evicted) return;
-
-    const shouldReload = window.confirm(
-      "ホストとの接続が切断されました。再読み込みして再接続しますか？",
-    );
-    if (shouldReload) window.location.reload();
-  }, [role, evicted]);
 
   /** What the stage shows: a selection being dragged moves before it is committed. */
   const displayStrokes = useMemo(() => {
@@ -817,7 +917,7 @@ export default function Home() {
   const beginStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.button !== 0) return;
     if (!roomRef.current?.canEdit()) {
-      setToast("接続が完了してから編集してください");
+      setToast(editBlockedMessage());
       return;
     }
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -1130,7 +1230,7 @@ export default function Home() {
     if (!file) return;
     if (!roomRef.current?.canEdit()) {
       event.target.value = "";
-      setToast("接続が完了してから音源を読み込んでください");
+      setToast(editBlockedMessage("音源を読み込んで"));
       return;
     }
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -1536,13 +1636,46 @@ export default function Home() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark">S</span><span>STORYBOARD</span><b>JAM</b></div>
         <div className="project-title">
-          <button className="crumb">Projects</button><span>/</span>
+          <div className="crumb-wrap">
+            <button className="crumb" onClick={() => {
+              setRoomEntries(readRoomIndex());
+              setProjectsOpen((open) => !open);
+            }} aria-expanded={projectsOpen}>Projects</button>
+            {projectsOpen && (
+              <div className="projects-list" role="dialog" aria-label="プロジェクト履歴">
+                <div className="people-head"><span>この端末の履歴</span><button onClick={() => setProjectsOpen(false)}>×</button></div>
+                {roomEntries.length === 0 && <p className="field-hint">まだ履歴がありません</p>}
+                {(["host", "guest"] as const).map((kind) => {
+                  const rows = roomEntries.filter((entry) => entry.role === kind);
+                  if (!rows.length) return null;
+                  return (
+                    <section key={kind}>
+                      <h4>{kind === "host" ? "作成したプロジェクト" : "参加したルーム"}</h4>
+                      <ul>
+                        {rows.map((entry) => (
+                          <li key={entry.id} className={entry.id === roomIdRef.current ? "current" : undefined}>
+                            <button className="open" onClick={() => openRoom(entry.id)}>
+                              <b>{entry.name.trim() || "無題のプロジェクト"}</b>
+                              <small>{formatVisited(entry.updatedAt)}{entry.id === roomIdRef.current ? "・表示中" : ""}</small>
+                            </button>
+                            <button className="kick" onClick={() => dropRoomEntry(entry)}>削除</button>
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  );
+                })}
+                <p className="field-hint">{"履歴はこの端末にだけ残ります。参加したルームの控えは新しい" + GUEST_BACKUP_LIMIT + "件まで保持されます"}</p>
+              </div>
+            )}
+          </div><span>/</span>
           <BufferedField aria-label="プロジェクト名" placeholder="無題のプロジェクト" value={projectName}
-            onCommit={renameProject} disabled={role === "connecting"} />
+            onCommit={renameProject} disabled={role === "connecting" || readOnly} />
           <span className="saved"><i />{
             role === "host" ? "この端末に保存"
               : role === "guest" ? "同期＋バックアップ"
-                : role === "closed" ? "この端末にバックアップ"
+                : role === "waiting" ? "読み取り専用（ホスト待ち）"
+                  : role === "closed" ? (readOnly ? "読み取り専用（控え）" : "この端末にバックアップ")
                   : "接続中"
           }</span>
         </div>
@@ -1586,16 +1719,32 @@ export default function Home() {
                     <b>{guestLabel(participant, index)}</b>
                     {participant.isHost && <small>ホスト</small>}
                     {role === "host" && !participant.isHost && (
-                      <button className="kick" onClick={() => kickParticipant(participant, index)}>退出</button>
+                      <>
+                        <button className="promote" onClick={() => handOverHost(participant, index)}>ホストを譲る</button>
+                        <button className="kick" onClick={() => kickParticipant(participant, index)}>退出</button>
+                      </>
                     )}
                   </li>
                 ))}
               </ul>
-              {role !== "host" && <p className="field-hint">退出させられるのはホストだけです</p>}
+              <p className="field-hint">{role === "host"
+                ? "ホストはこの一覧からしか交代できません"
+                : "ホストを譲れるのも退出させられるのもホストだけです"}</p>
             </div>
           )}
         </div>
       </header>
+
+      {(role === "waiting" || evicted) && (
+        // A banner rather than a modal: the board is read-only, but looking at it
+        // and exporting a copy are still worth allowing.
+        <div className={evicted ? "room-banner evicted" : "room-banner"} role="status">
+          <strong>{evicted ? "ルームから退出させられました" : "ホストの再接続を待っています"}</strong>
+          <span>{evicted
+            ? "ホストによってこのルームから外されました。表示中の内容は書き出せます。"
+            : "ホストが戻ると自動でつながります。それまでは読み取り専用です。"}</span>
+        </div>
+      )}
 
       <section className="workspace">
         <aside className="cuts-panel">
