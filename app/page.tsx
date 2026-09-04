@@ -2002,7 +2002,9 @@ export default function Home() {
                 <strong>{audioName || "音源なし"}</strong>
                 <small>{audioUrl ? "クリックで音源を変更" : "クリックで音源を選択（全体の尺が決まります）"}</small>
               </div>
-              <input type="file" accept="audio/*" onChange={onAudio} />
+              {/* iPadOS greys out MP3s under a bare audio/* filter, so the common
+                  extensions and MIME types are spelled out for the Files picker. */}
+              <input type="file" accept=".mp3,.m4a,.aac,.wav,.aiff,.aif,.flac,.ogg,.oga,.opus,.caf,audio/mpeg,audio/mp3,audio/mp4,audio/x-m4a,audio/aac,audio/wav,audio/x-wav,audio/aiff,audio/x-aiff,audio/flac,audio/ogg,audio/*" onChange={onAudio} />
             </label>
             <button className="split-action" onClick={splitAtPlayhead} title="再生位置でカットを分割 (S)">✂ 分割</button>
             <label className="volume-control" title="音量">
