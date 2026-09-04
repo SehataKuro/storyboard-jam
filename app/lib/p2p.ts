@@ -38,16 +38,74 @@ export type RoomHandlers = {
   requestPassword: (retry: boolean) => Promise<string | null>;
   /** The room's protection state changed, so the header can show a lock. */
   onProtected: (locked: boolean) => void;
+  /**
+   * The key this device should use for its recovery copy, or null while the room
+   * is open to anyone. A protected room's copy is useless without the passphrase.
+   */
+  onCacheKey: (key: CryptoKey | null) => void;
   getSnapshot: () => RoomSnapshot;
 };
 
 /** Where a browser keeps the key proving it owns a room. Losing it closes the room for good. */
 export const ownerKeyStorageKey = (roomId: string) => `conte-live-owner:${roomId}`;
 
+/**
+ * How a digest was derived. The digest is what the room checks, so it is itself
+ * the credential: "v1", a bare SHA-256, could be reversed from a leaked copy or
+ * guessed from a table. "v2" derives it with PBKDF2 salted by the room name, so
+ * one stolen digest is worth nothing anywhere else and costs real work to crack.
+ * Rooms protected before the change still answer "v1", and are upgraded silently
+ * the next time their host proves the passphrase.
+ */
+export type PasswordScheme = "v1" | "v2";
+
+/** Deliberately slow: it is what stands between a short passphrase and a list. */
+const PBKDF2_ITERATIONS = 210_000;
+
+/**
+ * The key that encrypts this device's recovery copy of a protected room. It is
+ * derived from the same passphrase but with its own salt, so the digest sent to
+ * the room can never be used to read the cache, nor the cache to guess the digest.
+ */
+export async function deriveCacheKey(password: string, room: string) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"],
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: new TextEncoder().encode(`conte-live-cache:${room}`),
+      iterations: PBKDF2_ITERATIONS,
+    },
+    key,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+const toHex = (buffer: ArrayBuffer) =>
+  [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+
 /** The passphrase never leaves the browser: only its digest is sent. */
-export async function hashPassword(password: string) {
-  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
-  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+export async function hashPassword(password: string, room: string, scheme: PasswordScheme = "v2") {
+  const bytes = new TextEncoder().encode(password);
+  if (scheme === "v1") return toHex(await crypto.subtle.digest("SHA-256", bytes));
+  const key = await crypto.subtle.importKey("raw", bytes, "PBKDF2", false, ["deriveBits"]);
+  const derived = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      // The room name is a poor secret but a fine salt: it stops one table from
+      // covering every room at once.
+      salt: new TextEncoder().encode(`conte-live:${room}`),
+      iterations: PBKDF2_ITERATIONS,
+    },
+    key,
+    256,
+  );
+  return toHex(derived);
 }
 
 const ICE_SERVERS: RTCIceServer[] = [
@@ -113,6 +171,13 @@ export class Room {
   private wrongPassword = false;
   /** Set when the passphrase prompt was dismissed: this tab never got in. */
   private authCancelled = false;
+  /** The derivation this room's stored digest uses, as reported by the gate. */
+  private passwordScheme: PasswordScheme = "v2";
+  /**
+   * A v2 digest of the passphrase that just opened a legacy room, kept until we
+   * know we are its host and can quietly re-store it under the newer derivation.
+   */
+  private pendingUpgrade: string | null = null;
 
   constructor(private room: string, private handlers: RoomHandlers) {}
 
@@ -172,9 +237,12 @@ export class Room {
    */
   async setPassword(password: string) {
     if (this.role !== "host") return;
-    this.passwordHash = password ? await hashPassword(password) : null;
-    this.socket?.send(JSON.stringify({ type: "set-password", hash: this.passwordHash }));
+    this.passwordScheme = "v2";
+    this.pendingUpgrade = null;
+    this.passwordHash = password ? await hashPassword(password, this.room) : null;
+    this.socket?.send(JSON.stringify({ type: "set-password", hash: this.passwordHash, scheme: "v2" }));
     this.handlers.onProtected(this.passwordHash !== null);
+    this.handlers.onCacheKey(password ? await deriveCacheKey(password, this.room) : null);
   }
 
   /**
@@ -269,13 +337,16 @@ export class Room {
     hostId?: string;
     ownerKey?: string;
     needsPassword?: boolean;
-    isFirst?: boolean;
+    scheme?: PasswordScheme;
+    retryAfter?: number;
     from?: string;
     payload?: { sdp?: RTCSessionDescriptionInit; ice?: RTCIceCandidateInit };
   }) {
     if (message.type === "gate") {
       // A protected room asks before it lets anyone see who else is inside.
+      let cacheKey: CryptoKey | null = null;
       if (message.needsPassword) {
+        this.passwordScheme = message.scheme === "v1" ? "v1" : "v2";
         const password = await this.handlers.requestPassword(this.wrongPassword);
         if (password === null) {
           this.authCancelled = true;
@@ -286,18 +357,33 @@ export class Room {
           return;
         }
         this.authCancelled = false;
-        this.passwordHash = await hashPassword(password);
+        this.passwordHash = await hashPassword(password, this.room, this.passwordScheme);
+        // Derive the newer digest now, while the passphrase is still at hand.
+        this.pendingUpgrade = this.passwordScheme === "v1"
+          ? await hashPassword(password, this.room)
+          : null;
+        cacheKey = await deriveCacheKey(password, this.room);
       }
       this.handlers.onProtected(Boolean(message.needsPassword));
-      this.socket?.send(JSON.stringify({ type: "auth", hash: this.passwordHash, ownerKey: this.readOwnerKey() }));
+      this.handlers.onCacheKey(cacheKey);
+      this.socket?.send(JSON.stringify({
+        type: "auth",
+        hash: this.passwordHash,
+        scheme: this.passwordScheme,
+        ownerKey: this.readOwnerKey(),
+      }));
       return;
     }
 
     if (message.type === "denied") {
-      // Reconnect and ask again: the socket is closed by the room.
+      // Reconnect and ask again: the socket is closed by the room. After enough
+      // wrong guesses the room makes us wait, and asking sooner is pointless.
       this.wrongPassword = true;
-      this.handlers.onStatus("パスワードが違います");
-      window.setTimeout(() => { if (!this.closedByUs) this.connect(); }, 400);
+      const retryAfter = Math.max(0, message.retryAfter ?? 0);
+      this.handlers.onStatus(retryAfter > 1000
+        ? `パスワードが違います。${Math.ceil(retryAfter / 1000)}秒後にもう一度試せます`
+        : "パスワードが違います");
+      window.setTimeout(() => { if (!this.closedByUs) this.connect(); }, Math.max(400, retryAfter));
       return;
     }
 
@@ -308,6 +394,14 @@ export class Room {
       this.authCancelled = false;
       if (message.ownerKey) this.writeOwnerKey(message.ownerKey);
       this.setRole(message.isHost ? "host" : "guest");
+      // Only the host may restate the passphrase, so a legacy room is upgraded
+      // the first time its owner comes back with the right one.
+      if (message.isHost && this.pendingUpgrade) {
+        this.passwordHash = this.pendingUpgrade;
+        this.passwordScheme = "v2";
+        this.pendingUpgrade = null;
+        this.socket?.send(JSON.stringify({ type: "set-password", hash: this.passwordHash, scheme: "v2" }));
+      }
       this.handlers.onStatus(message.isHost ? "ホストとしてルームを開きました" : "ホストへ接続中…");
       if (message.isHost) this.publishRoster();
       return;
