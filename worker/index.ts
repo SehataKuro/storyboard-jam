@@ -24,12 +24,40 @@ type Peer = { id: string; socket: WebSocket };
 /**
  * Relays SDP/ICE between peers of one room. It never sees storyboard data:
  * the host peer holds the authoritative project, so when the host leaves the room is closed.
+ *
+ * The room has one durable owner. Hosting is never granted by arriving first: it
+ * belongs to whoever holds the owner key, and the only way to move it is the host
+ * handing it to a named guest. That keeps exactly one authoritative copy of the
+ * board, so it can never fork or be replaced by an older one.
  */
 export class SignalRoom {
   private peers = new Map<string, Peer>();
   private hostId: string | null = null;
   /** SHA-256 of the room passphrase, chosen by the host. Never the plain text. */
   private passwordHash: string | null = null;
+  /** Secret minted for the room's creator and rotated on every handover. */
+  private ownerKey: string | null = null;
+  /** The key each joined peer presented, so the owner can be found again. */
+  private keys = new Map<string, string | null>();
+  /**
+   * Peers holding the line for an absent host, with the passphrase they already
+   * cleared. A dropped connection is usually a blip, so they are parked here
+   * instead of being sent away to reload by hand.
+   */
+  private waiting = new Map<string, { peer: Peer; hash: string | null; ownerKey: string | null }>();
+
+  constructor(private state: DurableObjectState) {
+    // Survives eviction: without it a forgotten room would let the next arrival
+    // host it, and that peer has no copy of the board.
+    state.blockConcurrencyWhile(async () => {
+      this.ownerKey = (await state.storage.get<string>("ownerKey")) ?? null;
+      this.passwordHash = (await state.storage.get<string>("passwordHash")) ?? null;
+    });
+  }
+
+  private persist() {
+    return this.state.storage.put({ ownerKey: this.ownerKey, passwordHash: this.passwordHash });
+  }
 
   fetch(request: Request): Response {
     if (request.headers.get("Upgrade") !== "websocket") {
@@ -42,44 +70,90 @@ export class SignalRoom {
 
     const id = crypto.randomUUID().slice(0, 8);
     const peer: Peer = { id, socket: server };
-    // The peer is not in the room until it has answered the gate: an
+    // The peer is in neither map until it has answered the gate: an
     // unauthenticated socket must not be able to see or signal anyone.
-    let joined = false;
-    this.send(peer, { type: "gate", isFirst: this.hostId === null, needsPassword: this.passwordHash !== null });
+    this.send(peer, { type: "gate", isFirst: this.ownerKey === null, needsPassword: this.passwordHash !== null });
 
-    const join = (hash: string | null) => {
-      const isHost = this.hostId === null;
-      if (isHost) {
-        this.hostId = id;
+    const admit = (isHost: boolean, ownerKey?: string) => {
+      this.peers.set(id, peer);
+      this.send(peer, { type: "welcome", peerId: id, isHost, hostId: this.hostId, ownerKey });
+    };
+
+    const join = (hash: string | null, ownerKey: string | null) => {
+      // Nobody has ever hosted this room, so this peer opens it and takes the key.
+      if (this.ownerKey === null) {
+        this.ownerKey = crypto.randomUUID();
         this.passwordHash = hash;
-      } else if (this.passwordHash && hash !== this.passwordHash) {
+        this.hostId = id;
+        void this.persist();
+        admit(true, this.ownerKey);
+        return;
+      }
+      if (this.hostId === null) {
+        // The room exists but its host is away. Only the owner can reopen it:
+        // anyone else would be hosting a board they do not have. They wait here
+        // rather than being turned away, and are let in when the host returns.
+        if (ownerKey !== this.ownerKey) {
+          if (this.passwordHash && hash !== this.passwordHash) {
+            this.send(peer, { type: "denied" });
+            try { server.close(1008, "wrong password"); } catch { /* already closing */ }
+            return;
+          }
+          this.waiting.set(id, { peer, hash, ownerKey });
+          this.send(peer, { type: "waiting" });
+          return;
+        }
+        this.hostId = id;
+        admit(true);
+        this.admitWaiting();
+        return;
+      }
+      if (this.passwordHash && hash !== this.passwordHash) {
         this.send(peer, { type: "denied" });
         try { server.close(1008, "wrong password"); } catch { /* already closing */ }
         return;
       }
-      joined = true;
-      this.peers.set(id, peer);
-      this.send(peer, { type: "welcome", peerId: id, isHost, hostId: this.hostId });
-      if (!isHost && this.hostId) {
-        const host = this.peers.get(this.hostId);
-        if (host) this.send(host, { type: "peer-join", peerId: id });
-      }
+      // A host that reloaded lands here: its previous socket is still counted as
+      // the host, so it joins as a guest and is promoted back once that one drops.
+      this.keys.set(id, ownerKey);
+      admit(false);
+      const host = this.peers.get(this.hostId);
+      if (host) this.send(host, { type: "peer-join", peerId: id });
     };
 
     server.addEventListener("message", (event) => {
-      let message: { type?: string; to?: string; payload?: unknown; hash?: string | null };
+      let message: { type?: string; to?: string; payload?: unknown; hash?: string | null; ownerKey?: string | null };
       try {
         message = JSON.parse(typeof event.data === "string" ? event.data : "");
       } catch {
         return;
       }
       if (message.type === "auth") {
-        if (!joined) join(message.hash ?? null);
+        if (!this.peers.has(id) && !this.waiting.has(id)) join(message.hash ?? null, message.ownerKey ?? null);
         return;
       }
-      if (!joined) return;
+      // Waiting peers are not in the room yet, so they may not signal anyone.
+      if (!this.peers.has(id)) return;
       if (message.type === "set-password" && id === this.hostId) {
         this.passwordHash = message.hash ?? null;
+        void this.persist();
+        return;
+      }
+      if (message.type === "handover" && message.to && id === this.hostId) {
+        const successor = this.peers.get(message.to);
+        if (!successor) return;
+        // Rotating the key is what actually moves ownership: the previous host's
+        // stored copy stops working, so it cannot reclaim the room later.
+        this.ownerKey = crypto.randomUUID();
+        this.hostId = message.to;
+        void this.persist();
+        this.send(successor, { type: "promoted", hostId: message.to, ownerKey: this.ownerKey });
+        this.peers.forEach((other, otherId) => {
+          if (otherId === message.to) return;
+          this.send(other, { type: "host-changed", hostId: message.to });
+          // The new host meshes with everyone through the usual invite path.
+          this.send(successor, { type: "peer-join", peerId: otherId });
+        });
         return;
       }
       if (message.type === "kick" && message.to && id === this.hostId) {
@@ -102,17 +176,56 @@ export class SignalRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  /**
+   * Hand the room back to the owner if they are already here. A host that reloads
+   * reconnects before its old socket is reported closed, so without this it would
+   * be parked in the waiting list holding the key to a room nobody is hosting.
+   */
+  private promoteWaitingOwner() {
+    if (this.ownerKey === null) return;
+    for (const [waitingId, entry] of this.waiting) {
+      if (entry.ownerKey !== this.ownerKey) continue;
+      this.waiting.delete(waitingId);
+      this.peers.set(waitingId, entry.peer);
+      this.hostId = waitingId;
+      this.send(entry.peer, { type: "welcome", peerId: waitingId, isHost: true, hostId: waitingId });
+      this.admitWaiting();
+      return;
+    }
+  }
+
+  /** Let everyone who was holding the line into the room the host just reopened. */
+  private admitWaiting() {
+    const host = this.hostId ? this.peers.get(this.hostId) : null;
+    this.waiting.forEach((entry, waitingId) => {
+      // The passphrase may have changed while they waited.
+      if (this.passwordHash && entry.hash !== this.passwordHash) {
+        this.send(entry.peer, { type: "denied" });
+        try { entry.peer.socket.close(1008, "wrong password"); } catch { /* already closing */ }
+        return;
+      }
+      this.peers.set(waitingId, entry.peer);
+      this.send(entry.peer, { type: "welcome", peerId: waitingId, isHost: false, hostId: this.hostId });
+      if (host) this.send(host, { type: "peer-join", peerId: waitingId });
+    });
+    this.waiting.clear();
+  }
+
   private drop(id: string) {
+    this.keys.delete(id);
+    if (this.waiting.delete(id)) return;
     if (!this.peers.delete(id)) return;
     if (this.hostId === id) {
-      // Host owned the only copy of the project, so the room ends with it.
+      // The host held the only copy of the project, so nobody can edit until they
+      // are back. The others keep their sockets and wait instead of reloading by
+      // hand, which turns a brief network blip into a short pause.
       this.hostId = null;
-      this.passwordHash = null;
-      this.peers.forEach((peer) => {
+      this.peers.forEach((peer, peerId) => {
         this.send(peer, { type: "host-gone" });
-        try { peer.socket.close(1000, "host left"); } catch { /* already closing */ }
+        this.waiting.set(peerId, { peer, hash: this.passwordHash, ownerKey: this.keys.get(peerId) ?? null });
       });
       this.peers.clear();
+      this.promoteWaitingOwner();
       return;
     }
     if (this.hostId) {

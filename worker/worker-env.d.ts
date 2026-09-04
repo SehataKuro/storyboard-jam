@@ -17,6 +17,16 @@ interface DurableObjectId {
   toString(): string;
 }
 
+interface DurableObjectStorage {
+  get<T>(key: string): Promise<T | undefined>;
+  put(entries: Record<string, unknown>): Promise<void>;
+}
+
+interface DurableObjectState {
+  storage: DurableObjectStorage;
+  blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
+}
+
 interface DurableObjectNamespace {
   idFromName(name: string): DurableObjectId;
   get(id: DurableObjectId): DurableObjectStub;

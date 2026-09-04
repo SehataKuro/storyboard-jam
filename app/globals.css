@@ -35,6 +35,7 @@ button { cursor:pointer; }
 .people-list li b { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650; }
 .people-list li small { color:var(--muted); font-size:9px; }
 .people-list .kick { border:1px solid #e0bdb4; color:#bd4f3c; background:#fff8f6; border-radius:5px; padding:3px 7px; font-size:9px; }
+.people-list .promote { border:1px solid #b9cfc3; color:#315e4b; background:#f4faf7; border-radius:5px; padding:3px 7px; font-size:9px; white-space:nowrap; }
 .presence-text { display:flex; align-items:center; gap:6px; color:var(--green); font-size:12px; font-weight:650; }
 .presence-text i.pulse { animation:pulse .7s ease; }
 @keyframes pulse { 50% { box-shadow:0 0 0 7px rgba(89,164,125,.2); } }
@@ -189,3 +190,20 @@ button { cursor:pointer; }
 .import-action:hover { background:#f2ede3; }
 .import-action input { display:none; }
 @media (max-width:900px) { .import-action { padding:7px 8px; font-size:10px; } }
+
+.room-banner { display:flex; align-items:center; gap:10px; padding:7px 14px; background:#fdf6e6; border-bottom:1px solid #e6d9b8; font-size:11px; }
+.room-banner strong { letter-spacing:.04em; }
+.room-banner span { color:var(--muted); }
+.room-banner.evicted { background:#fff8f6; border-bottom-color:#e0bdb4; }
+
+.crumb-wrap { position:relative; display:inline-flex; }
+.projects-list { position:absolute; top:calc(100% + 6px); left:0; z-index:30; width:280px; max-height:60vh; overflow:auto;
+  background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; box-shadow:0 12px 32px rgba(0,0,0,.18); }
+.projects-list h4 { margin:8px 0 4px; font-size:9px; letter-spacing:.08em; color:var(--muted); }
+.projects-list ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
+.projects-list li { display:flex; align-items:center; gap:6px; }
+.projects-list li.current { background:#f1f5f2; border-radius:6px; }
+.projects-list .open { flex:1; min-width:0; display:flex; flex-direction:column; gap:1px; align-items:flex-start;
+  background:none; border:0; padding:5px 6px; text-align:left; cursor:pointer; }
+.projects-list .open b { font-size:11px; font-weight:650; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.projects-list .open small { color:var(--muted); font-size:9px; }

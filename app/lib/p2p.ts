@@ -17,7 +17,7 @@ export type RoomOp =
   /** A whole board was imported from an exported bundle. */
   | { type: "replace"; project: Project };
 
-export type RoomRole = "connecting" | "host" | "guest" | "closed";
+export type RoomRole = "connecting" | "host" | "guest" | "waiting" | "closed";
 export type RoomSnapshot = { project: Project; projectName: string };
 /** Everyone currently in the room, as the host sees it. */
 export type Participant = { id: string; name: string; isHost: boolean };
@@ -41,6 +41,9 @@ export type RoomHandlers = {
   getSnapshot: () => RoomSnapshot;
 };
 
+/** Where a browser keeps the key proving it owns a room. Losing it closes the room for good. */
+export const ownerKeyStorageKey = (roomId: string) => `conte-live-owner:${roomId}`;
+
 /** The passphrase never leaves the browser: only its digest is sent. */
 export async function hashPassword(password: string) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
@@ -62,12 +65,49 @@ export class Room {
   private links = new Map<string, Link>();
   private role: RoomRole = "connecting";
   private hostId: string | null = null;
+  /** Set once this tab becomes host and never cleared: it holds the only copy. */
+  private ownsProject = false;
   private closedByUs = false;
   private selfId: string | null = null;
   private selfName = "";
   /** Host only: the display name each guest sent over its data channel. */
   private names = new Map<string, string>();
   private evicted = false;
+  /** Where this tab remembers the owner key of a room it hosts. */
+  private readOwnerKey() {
+    try {
+      this.ownerKeyInUse = window.localStorage.getItem(ownerKeyStorageKey(this.room));
+    } catch {
+      this.ownerKeyInUse = null;
+    }
+    return this.ownerKeyInUse;
+  }
+
+  private writeOwnerKey(key: string | null) {
+    this.ownerKeyInUse = key;
+    try {
+      if (key) window.localStorage.setItem(ownerKeyStorageKey(this.room), key);
+      else window.localStorage.removeItem(ownerKeyStorageKey(this.room));
+    } catch { /* a lost key only means the room cannot be reopened */ }
+  }
+
+  /**
+   * Give up the stored key, unless it is no longer ours. Two tabs of one browser
+   * share storage, so a handover between them would otherwise let the old host's
+   * cleanup delete the key the new host had just been given.
+   */
+  private releaseOwnerKey() {
+    try {
+      if (window.localStorage.getItem(ownerKeyStorageKey(this.room)) === this.ownerKeyInUse) {
+        this.writeOwnerKey(null);
+      }
+    } catch { /* nothing to release */ }
+    this.ownerKeyInUse = null;
+  }
+
+  /** The owner key this tab last presented or was given, to release only its own. */
+  private ownerKeyInUse: string | null = null;
+
   /** Digest of the passphrase this tab is holding, host or guest. */
   private passwordHash: string | null = null;
   private wrongPassword = false;
@@ -84,6 +124,16 @@ export class Room {
     socket.onerror = () => this.handlers.onStatus("シグナリングに接続できません");
     socket.onclose = () => {
       if (this.closedByUs || this.evicted || this.wrongPassword) return;
+      if (this.role === "waiting" || this.role === "guest") {
+        // Our own line dropped, or the room went away while we waited. Either way
+        // the board is still someone else's, so keep trying instead of making the
+        // user reload by hand.
+        this.setRole("waiting");
+        this.teardownLinks();
+        this.handlers.onStatus("接続が切れました。再接続しています…");
+        window.setTimeout(() => { if (!this.closedByUs) this.connect(); }, 3000);
+        return;
+      }
       const wasHost = this.role === "host";
       this.setRole("closed");
       this.handlers.onStatus(wasHost ? "ルームを終了しました" : "ホストが退出したため切断しました");
@@ -125,6 +175,15 @@ export class Room {
     this.handlers.onProtected(this.passwordHash !== null);
   }
 
+  /**
+   * Host only: give the room to a guest. This is the only way hosting ever moves,
+   * so the board never has two candidate copies.
+   */
+  handover(peerId: string) {
+    if (this.role !== "host" || peerId === this.selfId) return;
+    this.socket?.send(JSON.stringify({ type: "handover", to: peerId }));
+  }
+
   /** Host only: remove a guest from the room. */
   kick(peerId: string) {
     if (this.role !== "host" || peerId === this.selfId) return;
@@ -150,11 +209,21 @@ export class Room {
     });
   }
 
-  /** Closed rooms remain locally editable; guests wait for the data channel. */
+  /**
+   * The host keeps editing after a disconnect because the board is theirs, but a
+   * guest must not: their copy can never be published, so anything drawn once the
+   * host is gone would silently diverge and then be lost.
+   */
   canEdit() {
-    if (this.role === "host" || this.role === "closed") return true;
+    if (this.role === "host") return true;
+    if (this.role === "closed") return this.ownsProject;
     if (this.role !== "guest" || !this.hostId) return false;
     return this.links.get(this.hostId)?.channel?.readyState === "open";
+  }
+
+  /** True once this tab has held the board, so a closed room stays editable for it. */
+  isOwner() {
+    return this.ownsProject;
   }
 
   /** Host: push the authoritative project to every guest. */
@@ -174,6 +243,7 @@ export class Room {
   }
 
   private setRole(role: RoomRole) {
+    if (role === "host") this.ownsProject = true;
     this.role = role;
     this.handlers.onRole(role);
   }
@@ -187,6 +257,7 @@ export class Room {
     peerId?: string;
     isHost?: boolean;
     hostId?: string;
+    ownerKey?: string;
     needsPassword?: boolean;
     isFirst?: boolean;
     from?: string;
@@ -206,7 +277,7 @@ export class Room {
         this.passwordHash = await hashPassword(password);
       }
       this.handlers.onProtected(Boolean(message.needsPassword));
-      this.socket?.send(JSON.stringify({ type: "auth", hash: this.passwordHash }));
+      this.socket?.send(JSON.stringify({ type: "auth", hash: this.passwordHash, ownerKey: this.readOwnerKey() }));
       return;
     }
 
@@ -222,9 +293,43 @@ export class Room {
       this.hostId = message.hostId || null;
       this.selfId = message.peerId || null;
       this.wrongPassword = false;
+      if (message.ownerKey) this.writeOwnerKey(message.ownerKey);
       this.setRole(message.isHost ? "host" : "guest");
       this.handlers.onStatus(message.isHost ? "ホストとしてルームを開きました" : "ホストへ接続中…");
       if (message.isHost) this.publishRoster();
+      return;
+    }
+
+    if (message.type === "waiting") {
+      // The room's host is away. We hold the line: hosting is never granted by
+      // arriving first, so there is nothing to do but wait for them.
+      this.setRole("waiting");
+      this.handlers.onStatus("ホストの再接続を待っています");
+      return;
+    }
+
+    if (message.type === "promoted") {
+      // The host handed the room over. We already hold their latest snapshot as a
+      // guest, so we become the authoritative copy from here.
+      this.writeOwnerKey(message.ownerKey || null);
+      this.hostId = message.hostId || this.selfId;
+      this.teardownLinks();
+      this.setRole("host");
+      this.handlers.onStatus("ホストを引き継ぎました");
+      this.publishRoster();
+      return;
+    }
+
+    if (message.type === "host-changed") {
+      // Either we just gave the room away, or the host we were following did.
+      this.releaseOwnerKey();
+      // Handing the room over gives up the copy too, so a later disconnect leaves
+      // this tab read-only like any other guest.
+      this.ownsProject = false;
+      this.hostId = message.hostId || null;
+      this.teardownLinks();
+      this.setRole("guest");
+      this.handlers.onStatus("ホストが交代しました。新しいホストへ接続中…");
       return;
     }
 
@@ -253,8 +358,10 @@ export class Room {
     }
 
     if (message.type === "host-gone") {
-      this.setRole("closed");
-      this.handlers.onStatus("ホストが退出したため切断しました");
+      // Usually a blip rather than a goodbye: the socket stays open and the room
+      // lets us back in by itself once the host returns.
+      this.setRole("waiting");
+      this.handlers.onStatus("ホストとの接続が切れました。再接続を待っています");
       this.teardownLinks();
       return;
     }
