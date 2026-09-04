@@ -19,7 +19,7 @@ button { cursor:pointer; }
 .export-actions .action-group { display:flex; align-items:center; gap:5px; padding:3px 6px 3px 5px; border:1px solid var(--line); border-radius:8px; background:#faf7f1; }
 .export-actions .group-label { color:var(--muted); font-size:8px; font-weight:750; letter-spacing:.08em; }
 .export-actions .help-action { margin-right:2px; }
-.split-action { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:6px 9px; font-size:10px; white-space:nowrap; margin-left:auto; }
+.split-action { border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:6px; padding:6px 9px; font-size:10px; white-space:nowrap; margin-left:auto; }
 .split-action:hover { background:#f0ebe2; }
 .audio-info .volume-control { margin-left:8px; }
 .people { position:relative; display:flex; align-items:center; gap:10px; }
